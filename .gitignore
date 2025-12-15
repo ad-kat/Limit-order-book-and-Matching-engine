@@ -12,3 +12,7 @@ build/
 # Logs / misc
 *.log
 .DS_Store
+
+# Docs / temporary files
+*.docx
+~$*.docx
