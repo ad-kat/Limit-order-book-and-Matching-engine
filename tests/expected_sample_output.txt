@@ -1,0 +1,5 @@
+TRADE price=101 qty=7 buy=2 sell=1
+TRADE price=100 qty=2 buy=3 sell=4
+CANCEL id=3 OK
+TRADE price=101 qty=3 buy=5 sell=1
+FINAL best_bid=none best_ask=none
