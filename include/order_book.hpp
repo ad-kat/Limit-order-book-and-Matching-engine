@@ -1,5 +1,6 @@
 #pragma once
 
+#include <list>
 #include <cstdint>
 #include <deque>
 #include <map>
@@ -45,9 +46,10 @@ public:
     bool empty() const;
 
 private:
-    struct Level {
-        std::deque<Order> q; // FIFO
-    };
+    
+struct Level {
+    std::list<Order> q; // FIFO with stable iterators
+};
 
     // bids: highest price first
     std::map<std::int64_t, Level, std::greater<>> bids_;
@@ -57,13 +59,13 @@ private:
     // Locate an order for cancel: side + price + seq
     // We’ll keep it simple: (side, price, seq) and search within that level’s deque.
     struct Locator {
-        Side side;
-        std::int64_t price;
-        std::uint64_t seq;
-    };
-    std::unordered_map<OrderId, Locator> index_;
+    Side side;
+    std::int64_t price;
+    std::list<Order>::iterator it; // direct handle to the order node
+};
 
-    std::uint64_t next_seq_;
+std::unordered_map<OrderId, Locator> index_;
+std::uint64_t next_seq_;
 
 private:
     std::vector<Trade> match_incoming(Order& incoming);

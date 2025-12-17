@@ -49,7 +49,7 @@ add_test(NAME replay_sample
     -P ${CMAKE_SOURCE_DIR}/tests/replay_test.cmake
 )
 add_test(NAME bench_smoke COMMAND $<TARGET_FILE:lob> --bench 10000)
-ctest --test-dir build --output-on-failure
+
 
 include(GoogleTest)
 gtest_discover_tests(lob_tests)
