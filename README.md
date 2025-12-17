@@ -1,49 +1,40 @@
-# Limit Order Book & Matching Engine (C++)
+# Limit Order Book and Matching Engine (C++)
 
-A modern C++ implementation of a **limit order book and matching engine** with **price-time priority**, designed to model core exchange / trading-system mechanics.  
-The project emphasizes **correctness, performance, and clean system design**, with unit tests and benchmarking support.
+A single-threaded **price–time priority limit order book and matching engine** implemented in modern C++ with correctness tests, replay support, and performance benchmarks.
+
+This project models the core matching logic used in electronic exchanges and trading systems.
 
 ---
 
 ## Features
-- Limit and market orders (buy / sell)
-- Price-time priority matching
-- Order add / cancel / modify (via cancel + add)
-- Trade generation and top-of-book queries (best bid / ask)
-- Deterministic replay of order streams
-- Unit tests for matching correctness and book invariants
-- Benchmarking of throughput and latency under synthetic workloads
+- Price–time priority matching (FIFO within price levels)
+- Supports **LIMIT**, **MARKET**, and **CANCEL** orders
+- File-based order flow replay (exchange-style logs)
+- O(1) order cancellation using iterator-based indexing
+- Deterministic benchmarks with throughput and latency (p50 / p95)
+- Unit tests + integration replay tests
 
 ---
 
-## Design Overview
+## Data Structures & Design
+- **Price levels**: `std::map`
+  - bids sorted descending
+  - asks sorted ascending
+- **FIFO queues per level**: `std::list<Order>`
+- **Order index**: `unordered_map<OrderId, iterator>` for O(1) cancel
+- **Matching**: price-time priority, partial fills supported
 
-### Core Concepts
-- **Order**: uniquely identified, immutable price, mutable remaining quantity
-- **OrderBook**:
-  - Bid book: sorted by **descending price**, FIFO within price level
-  - Ask book: sorted by **ascending price**, FIFO within price level
-- **Matching Engine**:
-  - Aggressive orders match against the opposite side
-  - Enforces strict price-time priority
-  - Generates trades until filled or book is exhausted
-
-### Data Structures
-- Price levels stored using ordered associative containers
-- FIFO queues per price level to preserve time priority
-- Explicit separation of matching logic from book state
+### Time Complexity
+| Operation | Complexity |
+|---------|------------|
+| Add order | O(log N) |
+| Match | O(trades) |
+| Cancel | **O(1)** |
+| Best bid / ask | O(1) |
 
 ---
 
-## Build Instructions
-
-### Requirements
-- Linux / WSL2
-- C++20 compatible compiler (GCC ≥ 11)
-- CMake ≥ 3.16
-
-### Build
+## Build
 ```bash
-mkdir -p build
 cmake -S . -B build
 cmake --build build -j
