@@ -1,18 +1,35 @@
-# Build output
+# C++ build artifacts
+build/
+*.o
+*.a
+
+# Python
+__pycache__/
+*.pyc
+api/__pycache__/
+*.pyo
+.venv/
+venv/
+lobenv/
+*.egg-info/
+
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+.dockerignore
+node_modules/
+dist/
+.env
+
+#React
+lob-dashboard/node_modules/
 build/
 
-# Editor / IDE
-.vscode/
 
-# Compiled artifacts
-*.o
-*.out
-*.exe
-
-# Logs / misc
-*.log
-.DS_Store
-
-# Docs / temporary files
-*.docx
-~$*.docx

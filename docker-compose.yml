@@ -1,0 +1,16 @@
+version: "3.9"
+
+services:
+  lob-api:
+    build: .
+    container_name: lob-api
+    ports:
+      - "8000:8000"
+    environment:
+      - LOB_BINARY=/app/build/lob
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
