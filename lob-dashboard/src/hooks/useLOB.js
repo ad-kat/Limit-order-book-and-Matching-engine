@@ -1,4 +1,6 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useRef } from 'react'
+
+const WS_URL = (typeof __WS_URL__ !== 'undefined' ? __WS_URL__ : null) || 'ws://localhost:8000/ws'
 
 let mid = 29900
 let mockOrderId = 1
@@ -35,7 +37,7 @@ function mockTick(setState) {
   }))
 }
 
-export function useLOB(wsUrl = 'ws://localhost:8000/ws') {
+export function useLOB(wsUrl = WS_URL) {
   const [state, setState] = useState({
     bids: {}, asks: {}, trades: [], tradeCount: 0, connected: false
   })
@@ -43,7 +45,6 @@ export function useLOB(wsUrl = 'ws://localhost:8000/ws') {
   const wsRef     = useRef(null)
 
   useEffect(() => {
-    // Start mock immediately
     mockTimer.current = setInterval(() => mockTick(setState), 650)
 
     function connect() {
@@ -95,7 +96,7 @@ export function useLOB(wsUrl = 'ws://localhost:8000/ws') {
       clearInterval(mockTimer.current)
       wsRef.current?.close()
     }
-  }, [wsUrl])   // ← wsUrl only, no state deps = no loop
+  }, [wsUrl])
 
   return state
 }
