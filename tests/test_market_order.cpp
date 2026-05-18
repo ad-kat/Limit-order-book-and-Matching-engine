@@ -5,8 +5,8 @@ TEST(MarketOrder, BuyMarketConsumesBestAsks) {
     OrderBook ob;
 
     // Two ask levels
-    ob.add_limit(1, Side::Sell, 101, 3);
-    ob.add_limit(2, Side::Sell, 102, 4);
+    (void)ob.add_limit(1, Side::Sell, 101, 3);
+    (void)ob.add_limit(2, Side::Sell, 102, 4);
 
     // Buy market 5 should take 3 @101 then 2 @102
     auto trades = ob.add_market(10, Side::Buy, 5);

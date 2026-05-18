@@ -4,9 +4,9 @@
 TEST(Matching, LimitBuyFillsAcrossMultipleAskLevels) {
     OrderBook ob;
 
-    ob.add_limit(1, Side::Sell, 101, 2);
-    ob.add_limit(2, Side::Sell, 102, 3);
-    ob.add_limit(3, Side::Sell, 103, 5);
+    (void)ob.add_limit(1, Side::Sell, 101, 2);
+    (void)ob.add_limit(2, Side::Sell, 102, 3);
+    (void)ob.add_limit(3, Side::Sell, 103, 5);
 
     // Buy 6 @ 102 -> should fill 2@101 + 3@102, then rest 1@102? NO, can't: it is incoming buy.
     // Actually buy 6 @ 102 will fill 2+3=5, leaving 1 unfilled -> it should REST as bid @102 with qty 1.

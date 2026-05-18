@@ -7,11 +7,15 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_compile_options(-Wall -Wextra -Wpedantic)
 
+# pthread required for std::shared_mutex on Linux
+find_package(Threads REQUIRED)
+
 # ---- Library target (your core engine) ----
 add_library(lob_core
     src/order_book.cpp
 )
 target_include_directories(lob_core PUBLIC include)
+target_link_libraries(lob_core PUBLIC Threads::Threads)
 
 # ---- Main executable ----
 add_executable(lob src/main.cpp)

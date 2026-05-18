@@ -4,7 +4,7 @@
 TEST(Cancel, RemovesRestingOrder) {
     OrderBook ob;
 
-    ob.add_limit(1, Side::Buy, 100, 5);
+    (void)ob.add_limit(1, Side::Buy, 100, 5);
     ASSERT_TRUE(ob.best_bid().has_value());
     EXPECT_EQ(*ob.best_bid(), 100);
 

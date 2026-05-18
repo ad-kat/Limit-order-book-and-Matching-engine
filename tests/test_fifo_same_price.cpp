@@ -5,8 +5,8 @@ TEST(FIFO, SamePriceExecutesOlderFirst) {
     OrderBook ob;
 
     // Two sells at same price, different order ids -> FIFO should fill id=1 then id=2
-    ob.add_limit(1, Side::Sell, 101, 5);
-    ob.add_limit(2, Side::Sell, 101, 5);
+    (void)ob.add_limit(1, Side::Sell, 101, 5);
+    (void)ob.add_limit(2, Side::Sell, 101, 5);
 
     // Buy 7 @ 101 -> should consume 5 from id=1, then 2 from id=2
     auto trades = ob.add_limit(3, Side::Buy, 101, 7);
