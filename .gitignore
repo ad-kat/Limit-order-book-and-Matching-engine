@@ -2,6 +2,7 @@
 build/
 *.o
 *.a
+*:Zone.Identifier
 
 # Python
 __pycache__/
