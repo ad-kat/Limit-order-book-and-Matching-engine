@@ -12,8 +12,12 @@ const globalStyle = `
   }
 `
 
+// Use build-time injected WS URL (set via VITE_API_URL env var)
+const WS_URL = (typeof __WS_URL__ !== 'undefined' ? __WS_URL__ : null) || 'ws://localhost:8000/ws'
+const WS_HOST = WS_URL.replace('wss://', '').replace('ws://', '').split('/')[0]
+
 export default function App() {
-  const { bids, asks, trades, tradeCount, connected } = useLOB('ws://localhost:8000/ws')
+  const { bids, asks, trades, tradeCount, connected } = useLOB(WS_URL)
 
   return (
     <>
@@ -53,7 +57,7 @@ export default function App() {
               boxShadow: connected ? '0 0 0 3px #D1FAE5' : '0 0 0 3px #FEF3C7',
             }} />
             <span style={{ fontSize: 12, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>
-              {connected ? 'live · localhost:8000' : 'mock data'}
+              {connected ? `live · ${WS_HOST}` : 'mock data'}
             </span>
           </div>
         </div>
