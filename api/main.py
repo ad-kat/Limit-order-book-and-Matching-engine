@@ -16,9 +16,14 @@ Swagger UI: http://localhost:8000/docs
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import random
+import time
 from contextlib import asynccontextmanager
 
+import httpx
+import yfinance as yf
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -43,12 +48,136 @@ logger = logging.getLogger("lob.api")
 engine = LOBEngine()
 ws_manager = ConnectionManager()
 
+TICKERS = ["AAPL", "MSFT", "NVDA", "TSLA", "GOOGL"]
+FEED_SPEED = 0.15   # seconds between bars
+_feed_order_id = 100_000
+
+
+def to_cents(price: float) -> int:
+    return max(1, int(round(price * 100)))
+
+
+async def _place_limit(side: str, price_cents: int, qty: int) -> dict:
+    global _feed_order_id
+    _feed_order_id += 1
+    trades, book = await engine.add_limit(_feed_order_id, side, price_cents, qty)
+    for t in trades:
+        await ws_manager.broadcast("trade", t.model_dump())
+    if book:
+        await ws_manager.broadcast("book", _book_dict(book))
+    return {"trades": trades, "book": book}
+
+
+async def _place_market(side: str, qty: int) -> dict:
+    global _feed_order_id
+    _feed_order_id += 1
+    trades, book = await engine.add_market(_feed_order_id, side, qty)
+    for t in trades:
+        await ws_manager.broadcast("trade", t.model_dump())
+    if book:
+        await ws_manager.broadcast("book", _book_dict(book))
+    return {"trades": trades, "book": book}
+
+
+async def _cancel_feed(order_id: int):
+    try:
+        found, book = await engine.cancel(order_id)
+        if book:
+            await ws_manager.broadcast("cancel", {"order_id": order_id, "book": _book_dict(book)})
+    except Exception:
+        pass
+
+
+async def _replay_ticker(ticker: str, resting: list) -> None:
+    global _feed_order_id
+    logger.info(f"[feed] Fetching {ticker} bars...")
+    try:
+        hist = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: yf.Ticker(ticker).history(period="5d", interval="1m")
+        )
+    except Exception as e:
+        logger.warning(f"[feed] yfinance error: {e}")
+        return
+
+    if hist.empty:
+        logger.warning(f"[feed] No data for {ticker}")
+        return
+
+    avg_vol = hist["Volume"].mean()
+    logger.info(f"[feed] Replaying {len(hist)} bars for {ticker}")
+
+    for ts, row in hist.iterrows():
+        o, h, l, c, vol = row["Open"], row["High"], row["Low"], row["Close"], row["Volume"]
+        mid = to_cents(c)
+        bid = to_cents(l)
+        ask = to_cents(h)
+        if ask - bid < 2:
+            bid, ask = mid - 1, mid + 1
+
+        qty_base = max(1, int(vol / avg_vol * 10))
+
+        # Cancel ~20% of resting orders
+        to_cancel = [oid for oid in resting if random.random() < 0.20]
+        for oid in to_cancel:
+            await _cancel_feed(oid)
+            resting.remove(oid)
+
+        # Resting SELL limit
+        try:
+            res = await _place_limit("SELL", ask, qty_base)
+            if not res["trades"]:
+                resting.append(_feed_order_id)
+        except Exception as e:
+            logger.debug(f"[feed] limit err: {e}")
+
+        # Resting BUY limit
+        try:
+            res = await _place_limit("BUY", bid, qty_base)
+            if not res["trades"]:
+                resting.append(_feed_order_id)
+        except Exception as e:
+            logger.debug(f"[feed] limit err: {e}")
+
+        # Volume spike → market order
+        if vol > avg_vol * 1.5:
+            side = "BUY" if c > o else "SELL"
+            try:
+                res = await _place_market(side, max(1, qty_base // 2))
+                logger.info(f"[feed] {ticker} SPIKE {side} → {len(res['trades'])} trade(s)")
+            except Exception as e:
+                logger.debug(f"[feed] market err: {e}")
+
+        # Keep order_id bounded
+        if _feed_order_id > 900_000:
+            _feed_order_id = 100_000
+
+        await asyncio.sleep(FEED_SPEED)
+
+
+async def market_feed_loop():
+    """Background task: loops through tickers forever."""
+    await asyncio.sleep(5)  # wait for engine to be ready
+    resting: list[int] = []
+    iteration = 0
+    while True:
+        iteration += 1
+        logger.info(f"[feed] === Cycle {iteration} ===")
+        for ticker in TICKERS:
+            try:
+                await _replay_ticker(ticker, resting)
+            except Exception as e:
+                logger.warning(f"[feed] ticker error: {e}")
+        logger.info("[feed] Cycle done. Sleeping 30s...")
+        await asyncio.sleep(30)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Start the C++ engine on startup, shut it down on exit."""
+    """Start the C++ engine and market feed on startup."""
     await engine.start()
+    feed_task = asyncio.create_task(market_feed_loop())
     yield
+    feed_task.cancel()
     await engine.stop()
 
 
@@ -64,7 +193,6 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Allow the React dashboard (any origin in dev; lock down in prod)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -93,7 +221,6 @@ async def health():
 
 @app.get("/book", response_model=BookSnapshot, tags=["Book"])
 async def get_book():
-    """Return the current best bid and best ask."""
     try:
         book = await engine.status()
         return book or BookSnapshot()
@@ -103,30 +230,21 @@ async def get_book():
 
 @app.post("/orders/limit", response_model=OrderResponse, tags=["Orders"])
 async def place_limit(req: LimitOrderRequest):
-    """Place a limit order. Returns any trades that were immediately executed."""
     try:
-        trades, book = await engine.add_limit(
-            req.order_id, req.side, req.price, req.qty
-        )
+        trades, book = await engine.add_limit(req.order_id, req.side, req.price, req.qty)
     except EngineError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    # Broadcast to WebSocket clients
     for t in trades:
         await ws_manager.broadcast("trade", t.model_dump())
     if book:
         await ws_manager.broadcast("book", _book_dict(book))
 
-    return OrderResponse(
-        status="ok",
-        trades=trades,
-        book=book,
-    )
+    return OrderResponse(status="ok", trades=trades, book=book)
 
 
 @app.post("/orders/market", response_model=OrderResponse, tags=["Orders"])
 async def place_market(req: MarketOrderRequest):
-    """Place a market order. Fills immediately against resting orders."""
     try:
         trades, book = await engine.add_market(req.order_id, req.side, req.qty)
     except EngineError as e:
@@ -137,16 +255,11 @@ async def place_market(req: MarketOrderRequest):
     if book:
         await ws_manager.broadcast("book", _book_dict(book))
 
-    return OrderResponse(
-        status="ok",
-        trades=trades,
-        book=book,
-    )
+    return OrderResponse(status="ok", trades=trades, book=book)
 
 
 @app.delete("/orders/{order_id}", response_model=CancelResponse, tags=["Orders"])
 async def cancel_order(order_id: int):
-    """Cancel a resting limit order by ID."""
     try:
         found, book = await engine.cancel(order_id)
     except EngineError as e:
@@ -166,19 +279,7 @@ async def cancel_order(order_id: int):
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
-    """
-    Real-time stream of trade and book events.
-
-    Connect with any WS client:
-      wscat -c ws://localhost:8000/ws
-
-    Messages are JSON:
-      {"event": "trade",  "payload": {"price": 101, "qty": 5, ...}}
-      {"event": "book",   "payload": {"best_bid": 100, "best_ask": 101, "spread": 1}}
-      {"event": "cancel", "payload": {"order_id": 42, "book": {...}}}
-    """
     await ws_manager.connect(ws)
-    # Send current book state on connect
     try:
         book = await engine.status()
         if book:
@@ -188,7 +289,6 @@ async def websocket_endpoint(ws: WebSocket):
 
     try:
         while True:
-            # Keep connection alive; clients can send pings
             await ws.receive_text()
     except WebSocketDisconnect:
         await ws_manager.disconnect(ws)
