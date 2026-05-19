@@ -3,6 +3,7 @@ import { useLOB } from './hooks/useLOB'
 import StatsBar   from './components/StatsBar'
 import OrderBook  from './components/OrderBook'
 import TradeTape  from './components/TradeTape'
+import Commentary from './components/Commentary'
 
 // Inline keyframe for trade row animation
 const globalStyle = `
@@ -17,7 +18,7 @@ const WS_URL = (typeof __WS_URL__ !== 'undefined' ? __WS_URL__ : null) || 'ws://
 const WS_HOST = WS_URL.replace('wss://', '').replace('ws://', '').split('/')[0]
 
 export default function App() {
-  const { bids, asks, trades, tradeCount, connected } = useLOB(WS_URL)
+  const { bids, asks, trades, tradeCount, connected, commentary } = useLOB(WS_URL)
 
   return (
     <>
@@ -64,6 +65,9 @@ export default function App() {
 
         {/* Stats */}
         <StatsBar bids={bids} asks={asks} tradeCount={tradeCount} connected={connected} />
+
+        {/* LLM Commentary */}
+        <Commentary commentary={commentary} />
 
         {/* Main grid */}
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 340px', gap: 16 }}>

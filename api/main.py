@@ -18,9 +18,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import random
 import time
 from contextlib import asynccontextmanager
+
+from dotenv import load_dotenv
+load_dotenv()
 
 import httpx
 import yfinance as yf
@@ -37,6 +41,7 @@ from .models import (
     BookSnapshot,
 )
 from .ws_manager import ConnectionManager
+from .commentary import get_commentary
 
 logging.basicConfig(
     level=logging.INFO,
@@ -52,9 +57,48 @@ TICKERS = ["AAPL", "MSFT", "NVDA", "TSLA", "GOOGL"]
 FEED_SPEED = 0.15   # seconds between bars
 _feed_order_id = 100_000
 
+# ── Commentary state ───────────────────────────────────────────────────────────
+_commentary_state: dict = {
+    "current_symbol": "AAPL",
+    "recent_trades": [],
+    "trade_count": 0,
+    "last_event": "init",
+}
+_last_commentary_time: float = 0.0
+COMMENTARY_INTERVAL = 8.0  # seconds between commentary broadcasts
+
 
 def to_cents(price: float) -> int:
     return max(1, int(round(price * 100)))
+
+
+async def _maybe_broadcast_commentary(book, event_type: str):
+    """Fire commentary if enough time has passed since last broadcast."""
+    global _last_commentary_time
+    now = time.time()
+    if now - _last_commentary_time < COMMENTARY_INTERVAL:
+        return
+    if not book:
+        return
+    _last_commentary_time = now
+    state = _commentary_state
+    try:
+        text = await get_commentary(
+            symbol=state["current_symbol"],
+            best_bid=book.best_bid,
+            best_ask=book.best_ask,
+            spread=book.spread,
+            last_event=event_type,
+            trade_count=state["trade_count"],
+            recent_trades=state["recent_trades"][-5:],
+        )
+        await ws_manager.broadcast("commentary", {
+            "symbol": state["current_symbol"],
+            "text": text,
+            "event": event_type,
+        })
+    except Exception as e:
+        logger.warning(f"[commentary] broadcast failed: {e}")
 
 
 async def _place_limit(side: str, price_cents: int, qty: int) -> dict:
@@ -62,9 +106,14 @@ async def _place_limit(side: str, price_cents: int, qty: int) -> dict:
     _feed_order_id += 1
     trades, book = await engine.add_limit(_feed_order_id, side, price_cents, qty)
     for t in trades:
-        await ws_manager.broadcast("trade", t.model_dump())
+        td = t.model_dump()
+        await ws_manager.broadcast("trade", td)
+        _commentary_state["recent_trades"].append(td)
+        _commentary_state["recent_trades"] = _commentary_state["recent_trades"][-20:]
+        _commentary_state["trade_count"] += 1
     if book:
         await ws_manager.broadcast("book", _book_dict(book))
+        await _maybe_broadcast_commentary(book, "limit")
     return {"trades": trades, "book": book}
 
 
@@ -73,9 +122,14 @@ async def _place_market(side: str, qty: int) -> dict:
     _feed_order_id += 1
     trades, book = await engine.add_market(_feed_order_id, side, qty)
     for t in trades:
-        await ws_manager.broadcast("trade", t.model_dump())
+        td = t.model_dump()
+        await ws_manager.broadcast("trade", td)
+        _commentary_state["recent_trades"].append(td)
+        _commentary_state["recent_trades"] = _commentary_state["recent_trades"][-20:]
+        _commentary_state["trade_count"] += 1
     if book:
         await ws_manager.broadcast("book", _book_dict(book))
+        await _maybe_broadcast_commentary(book, "market_order")
     return {"trades": trades, "book": book}
 
 
@@ -164,6 +218,9 @@ async def market_feed_loop():
         logger.info(f"[feed] === Cycle {iteration} ===")
         for ticker in TICKERS:
             try:
+                _commentary_state["current_symbol"] = ticker
+                _commentary_state["trade_count"] = 0
+                _commentary_state["recent_trades"] = []
                 await _replay_ticker(ticker, resting)
             except Exception as e:
                 logger.warning(f"[feed] ticker error: {e}")

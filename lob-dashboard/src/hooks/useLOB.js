@@ -39,7 +39,8 @@ function mockTick(setState) {
 
 export function useLOB(wsUrl = WS_URL) {
   const [state, setState] = useState({
-    bids: {}, asks: {}, trades: [], tradeCount: 0, connected: false
+    bids: {}, asks: {}, trades: [], tradeCount: 0, connected: false,
+    commentary: null,  // { symbol, text, event, ts }
   })
   const mockTimer = useRef(null)
   const wsRef     = useRef(null)
@@ -74,6 +75,12 @@ export function useLOB(wsUrl = WS_URL) {
               ...p,
               bids: best_bid ? { ...p.bids, [best_bid]: (p.bids[best_bid] || 0) + 1 } : p.bids,
               asks: best_ask ? { ...p.asks, [best_ask]: (p.asks[best_ask] || 0) + 1 } : p.asks,
+            }))
+          }
+          if (msg.event === 'commentary') {
+            setState(p => ({
+              ...p,
+              commentary: { ...msg.payload, ts: Date.now() },
             }))
           }
         } catch (_) {}
