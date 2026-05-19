@@ -5,16 +5,11 @@ Fetches real OHLCV data from Yahoo Finance (yfinance, free, no API key).
 Converts each bar into realistic limit + market orders.
 Feeds them to the running FastAPI server (POST /orders/limit etc).
 
-Strategy per bar:
-  - Derive synthetic bid/ask from OHLC (bid = low, ask = high, mid = close)
-  - Place a resting SELL limit at ask, BUY limit at bid
-  - If volume spike → fire a market order to simulate aggression
-  - Randomly cancel ~20% of resting orders (realistic churn)
+Run locally:
+  python3 market_feed.py --ticker AAPL --speed 0.2
+  python3 market_feed.py --ticker AAPL --speed 0.05 --api-url https://your-railway-url.up.railway.app
 
-Run:
-  python3 market_feed.py --ticker AAPL --interval 1m --period 1d --speed 0.1
-  python3 market_feed.py --ticker AAPL --api-url https://your-railway-url.up.railway.app
-  (speed = seconds between bars; 0.1 = fast replay, 1.0 = real-time feel)
+Railway worker: set API_URL env var, runs with --loop flag forever.
 """
 
 import argparse
@@ -22,125 +17,132 @@ import time
 import random
 import requests
 import yfinance as yf
+import os
 
 session = requests.Session()
 
+TICKERS = ["AAPL", "MSFT", "NVDA", "TSLA", "GOOGL"]
+
 
 def to_cents(price: float) -> int:
-    """Convert float price to integer cents (engine uses integers)."""
     return max(1, int(round(price * 100)))
 
 
-def place_limit(api: str, order_id: int, side: str, price_cents: int, qty: int) -> dict:
+def place_limit(api, order_id, side, price_cents, qty):
     r = session.post(f"{api}/orders/limit", json={
-        "order_id": order_id,
-        "side": side,
-        "price": price_cents,
-        "qty": qty,
-    }, timeout=3)
+        "order_id": order_id, "side": side, "price": price_cents, "qty": qty,
+    }, timeout=5)
     return r.json()
 
 
-def place_market(api: str, order_id: int, side: str, qty: int) -> dict:
+def place_market(api, order_id, side, qty):
     r = session.post(f"{api}/orders/market", json={
-        "order_id": order_id,
-        "side": side,
-        "qty": qty,
-    }, timeout=3)
+        "order_id": order_id, "side": side, "qty": qty,
+    }, timeout=5)
     return r.json()
 
 
-def cancel(api: str, order_id: int) -> dict:
-    r = session.delete(f"{api}/orders/{order_id}", timeout=3)
+def cancel_order(api, order_id):
+    r = session.delete(f"{api}/orders/{order_id}", timeout=5)
     return r.json()
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--ticker", default="AAPL")
-    ap.add_argument("--interval", default="1m", help="1m 2m 5m")
-    ap.add_argument("--period", default="1d", help="1d 5d")
-    ap.add_argument("--speed", type=float, default=0.2,
-                    help="Seconds between bars (0.1=fast, 1.0=slow)")
-    ap.add_argument("--api-url", default="http://127.0.0.1:8000",
-                    help="Base URL of the LOB API (default: http://127.0.0.1:8000)")
-    args = ap.parse_args()
-
-    api = args.api_url.rstrip("/")
-    print(f"API target: {api}")
-    print(f"Fetching {args.ticker} {args.interval} bars ({args.period})...")
-
-    ticker = yf.Ticker(args.ticker)
-    hist = ticker.history(period=args.period, interval=args.interval)
+def replay_ticker(api, ticker, speed, order_id_start):
+    print(f"\n[feed] Fetching {ticker} 1m bars (5d)...")
+    try:
+        hist = yf.Ticker(ticker).history(period="5d", interval="1m")
+    except Exception as e:
+        print(f"[feed] yfinance error: {e}")
+        return order_id_start
 
     if hist.empty:
-        print("No data returned. Market may be closed. Try --period 5d.")
-        return
+        print(f"[feed] No data for {ticker}, skipping.")
+        return order_id_start
 
-    print(f"Got {len(hist)} bars. Replaying into LOB engine...\n")
-
-    order_id = 1000          # start high so no clash with manual orders
-    resting: list[int] = []  # track live order IDs for cancels
+    print(f"[feed] Got {len(hist)} bars. Replaying...")
+    order_id = order_id_start
+    resting = []
     avg_vol = hist["Volume"].mean()
 
     for ts, row in hist.iterrows():
         o, h, l, c, vol = row["Open"], row["High"], row["Low"], row["Close"], row["Volume"]
+        mid = to_cents(c)
+        bid = to_cents(l)
+        ask = to_cents(h)
+        if ask - bid < 2:
+            bid, ask = mid - 1, mid + 1
 
-        # Synthetic bid/ask from bar
-        mid   = to_cents(c)
-        bid   = to_cents(l)           # conservative bid = bar low
-        ask   = to_cents(h)           # conservative ask = bar high
-        spread = ask - bid
-        if spread < 2:                # enforce min 2-cent spread
-            bid  = mid - 1
-            ask  = mid + 1
+        qty_base = max(1, int(vol / avg_vol * 10))
 
-        qty_base = max(1, int(vol / avg_vol * 10))  # scale qty to relative volume
-
-        # Cancel ~20% of resting orders (realistic churn)
-        to_cancel = [oid for oid in resting if random.random() < 0.20]
-        for oid in to_cancel:
+        for oid in [o for o in resting if random.random() < 0.20]:
             try:
-                cancel(api, oid)
+                cancel_order(api, oid)
                 resting.remove(oid)
             except Exception:
                 pass
 
-        # Place resting SELL limit at ask
-        res = place_limit(api, order_id, "SELL", ask, qty_base)
-        trades = res.get("trades", [])
-        if not trades:               # only track if not immediately filled
-            resting.append(order_id)
+        try:
+            res = place_limit(api, order_id, "SELL", ask, qty_base)
+            if not res.get("trades"):
+                resting.append(order_id)
+        except Exception as e:
+            print(f"[feed] error: {e}")
         order_id += 1
 
-        # Place resting BUY limit at bid
-        res = place_limit(api, order_id, "BUY", bid, qty_base)
-        trades = res.get("trades", [])
-        if not trades:
-            resting.append(order_id)
+        try:
+            res = place_limit(api, order_id, "BUY", bid, qty_base)
+            if not res.get("trades"):
+                resting.append(order_id)
+        except Exception as e:
+            print(f"[feed] error: {e}")
         order_id += 1
 
-        # Volume spike → aggressive market order
         if vol > avg_vol * 1.5:
             side = "BUY" if c > o else "SELL"
             mkt_qty = max(1, qty_base // 2)
-            res = place_market(api, order_id, side, mkt_qty)
-            trades = res.get("trades", [])
-            trade_str = f"  → {len(trades)} trade(s)" if trades else ""
-            print(f"[{ts}] SPIKE vol={int(vol):>10,} MARKET {side} {mkt_qty}{trade_str}")
+            try:
+                res = place_market(api, order_id, side, mkt_qty)
+                trades = res.get("trades", [])
+                print(f"[{ts}] {ticker} SPIKE {side} {mkt_qty} → {len(trades)} trade(s)")
+            except Exception as e:
+                print(f"[feed] error: {e}")
             order_id += 1
         else:
-            book = res.get("book", {})
-            bb = book.get("best_bid") or "none"
-            ba = book.get("best_ask") or "none"
-            bb_str = f"${int(bb)/100:.2f}" if bb != "none" else "none"
-            ba_str = f"${int(ba)/100:.2f}" if ba != "none" else "none"
-            print(f"[{ts}] O={o:.2f} H={h:.2f} L={l:.2f} C={c:.2f} "
-                  f"bid={bb_str} ask={ba_str} resting={len(resting)}")
+            try:
+                book = res.get("book", {})
+                bb = book.get("best_bid") or "none"
+                ba = book.get("best_ask") or "none"
+                bb_str = f"${int(bb)/100:.2f}" if bb != "none" else "none"
+                ba_str = f"${int(ba)/100:.2f}" if ba != "none" else "none"
+                print(f"[{ts}] {ticker} bid={bb_str} ask={ba_str} resting={len(resting)}")
+            except Exception:
+                pass
 
-        time.sleep(args.speed)
+        time.sleep(speed)
 
-    print(f"\nDone. {order_id - 1000} orders sent.")
+    return order_id if order_id < 900_000 else 1000
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ticker", default=None)
+    ap.add_argument("--speed", type=float, default=0.2)
+    ap.add_argument("--api-url", default=os.environ.get("API_URL", "http://127.0.0.1:8000"))
+    ap.add_argument("--loop", action="store_true", default=False)
+    args = ap.parse_args()
+
+    api = args.api_url.rstrip("/")
+    tickers = [args.ticker] if args.ticker else TICKERS
+    print(f"[feed] API: {api} | tickers: {tickers} | loop: {args.loop}")
+
+    order_id = 1000
+    while True:
+        for ticker in tickers:
+            order_id = replay_ticker(api, ticker, args.speed, order_id)
+        if not args.loop:
+            break
+        print("[feed] Cycle done. Sleeping 30s...")
+        time.sleep(30)
 
 
 if __name__ == "__main__":

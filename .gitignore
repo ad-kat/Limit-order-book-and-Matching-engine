@@ -33,4 +33,9 @@ dist/
 lob-dashboard/node_modules/
 build/
 
-
+#Misc
+.vercel
+.env*.local
+.env.local
+*.tar.gz
+google-cloud-sdk/
