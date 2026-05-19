@@ -29,7 +29,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy Python source
 COPY api/ api/
-
+COPY market_feed.py .
 ENV LOB_BINARY=/app/build/lob
 ENV PYTHONUNBUFFERED=1
 
