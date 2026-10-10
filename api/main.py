@@ -42,6 +42,8 @@ from .models import (
 )
 from .ws_manager import ConnectionManager
 from .commentary import get_commentary
+from .fairsplit import fairsplit_router
+from .fairsplit_agent import agent_websocket_handler
 
 logging.basicConfig(
     level=logging.INFO,
@@ -256,6 +258,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── FairSplit router ───────────────────────────────────────────────────────────
+app.include_router(fairsplit_router)
+
+
+@app.websocket("/fairsplit/agent")
+async def fairsplit_agent_ws(ws: WebSocket):
+    await agent_websocket_handler(ws)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

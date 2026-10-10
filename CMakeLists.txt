@@ -57,3 +57,10 @@ add_test(NAME bench_smoke COMMAND $<TARGET_FILE:lob> --bench 10000)
 
 include(GoogleTest)
 gtest_discover_tests(lob_tests)
+
+# ---- FairSplit Housing Matcher binary ----
+add_executable(housing_matcher src/housing_matcher.cpp)
+target_include_directories(housing_matcher PRIVATE include)
+# housing_matcher is intentionally standalone (no lob_core dep)
+# It uses the same priority-queue ranking concept as lob_core but operates
+# on roommate compatibility scores instead of order prices.

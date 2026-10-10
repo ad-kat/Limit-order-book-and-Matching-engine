@@ -1,3 +1,141 @@
+# FairSplit — AI-Powered Shared Housing Platform
+
+> **Hackathon:** The New Agentic Economy Hackathon · October 10, 2026 · Betaworks NYC · Forever 22  
+> Supported by **Google DeepMind**
+
+FairSplit makes finding compatible roommates effortless. Tell our Gemini Live AI agent what you need — budget, neighborhood, move-in date, lifestyle — and it searches apartments, ranks compatible groups, and creates roommate groups for you.
+
+---
+
+## Product Overview
+
+| Feature | Description |
+|---------|-------------|
+| **Apartment Discovery** | Browse NYC apartments with per-person rent calculated automatically |
+| **AI Roommate Matching** | C++ priority-queue matcher ranks groups by budget slack, date overlap, and lifestyle compatibility |
+| **Gemini Live Voice Agent** | Talk naturally to FairSplit — real-time audio with tool calling |
+| **Group Management** | Propose groups, send invitations, track acceptance status |
+| **Full Stack** | FastAPI + Supabase backend, React/Vite frontend, C++20 matcher binary |
+
+---
+
+## Demo Scenario
+
+**Required demo:** Brooklyn 3BR apartment, $3,660/mo ($1,220/person), 3 non-smoking students with ~$1,300 budget, all moving in November 2026.
+
+```bash
+# Run seed script to load demo data
+python3 scripts/seed_fairsplit.py
+
+# Then ask the voice agent:
+# "Find compatible roommates for the Park Slope 3BR"
+```
+
+The AI finds Alex Chen, Jordan Lee, and Sam Rivera — all non-smokers, $1,280–$1,350 budget, November move-in — as the top-ranked group.
+
+---
+
+## Architecture
+
+```
+User (browser)
+    ↓  WebSocket / REST
+FastAPI (api/main.py)
+    ├── /fairsplit/*  →  api/fairsplit.py  (Supabase CRUD)
+    ├── /fairsplit/agent  →  api/fairsplit_agent.py  (Gemini Live proxy)
+    └── /orders/*  →  api/engine.py  (C++ LOB subprocess)
+
+C++ Binaries (stdin/stdout protocol)
+    ├── build/lob              ← Limit Order Book matching engine
+    └── build/housing_matcher  ← Roommate compatibility scorer
+
+Frontend (lob-dashboard/src/)
+    ├── FairSplitApp.jsx   ← Default: 4-tab FairSplit UI
+    └── App.jsx            ← Original LOB dashboard (preserved)
+
+Database
+    └── Supabase (PostgreSQL + RLS)
+        apartments, profiles, housing_preferences,
+        roommate_groups, group_members, agent_activity
+```
+
+**Key architectural insight:** The `housing_matcher` C++ binary reuses the priority-queue pattern from the LOB engine. Where the LOB ranks bids by price (highest first), the matcher ranks roommate groups by compatibility score (highest first) — same data structure, different domain.
+
+---
+
+## FairSplit Setup Instructions
+
+### 1. Environment Variables
+
+```bash
+cp .env.example .env
+# Edit .env with your keys
+```
+
+Required:
+- `GEMINI_API_KEY` — for voice agent ([get one](https://aistudio.google.com/app/apikey))
+- `SUPABASE_URL` + `SUPABASE_KEY` + `SUPABASE_SERVICE_KEY` — optional (falls back to in-memory demo data)
+
+### 2. Build C++ Matcher
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target housing_matcher -j$(nproc)
+```
+
+### 3. Seed Demo Data
+
+```bash
+# With Supabase configured:
+python3 scripts/seed_fairsplit.py
+
+# Without Supabase (prints SQL):
+python3 scripts/seed_fairsplit.py  # outputs SQL to stdout
+```
+
+### 4. Start the API
+
+```bash
+source lobenv/bin/activate
+HOUSING_MATCHER_BINARY=./build/housing_matcher uvicorn api.main:app --reload --port 8000
+```
+
+FairSplit endpoints: http://localhost:8000/docs#/FairSplit
+
+### 5. Start the Frontend
+
+```bash
+cd lob-dashboard
+export PATH=/usr/bin:$PATH  # WSL only
+npm install
+npm run dev  # → http://localhost:5173
+```
+
+### 6. Run FairSplit Tests
+
+```bash
+pytest tests/test_fairsplit.py -v
+```
+
+---
+
+## FairSplit API Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/fairsplit/apartments` | List all apartments |
+| `GET` | `/fairsplit/apartments/{id}` | Get apartment details |
+| `POST` | `/fairsplit/search` | Search by budget/neighborhood/bedrooms |
+| `POST` | `/fairsplit/match` | Find compatible roommate groups (C++ matcher) |
+| `POST` | `/fairsplit/groups` | Propose a roommate group |
+| `GET` | `/fairsplit/groups/{id}` | Get group status and members |
+| `POST` | `/fairsplit/groups/{id}/invite` | Invite someone to a group |
+| `POST` | `/fairsplit/invitations/{id}/accept` | Accept an invitation |
+| `GET` | `/fairsplit/profiles/{id}/groups` | Get user's groups |
+| `WS` | `/fairsplit/agent` | Gemini Live voice agent proxy |
+
+---
+
 # Limit Order Book & Matching Engine
 
 A price-time priority matching engine written in C++20, capable of ~1.9M operations/sec with sub-microsecond median latency. The C++ engine is the actual project — FastAPI, React dashboard, LLM commentary agent, and market data feed are all demo infrastructure built on top.
