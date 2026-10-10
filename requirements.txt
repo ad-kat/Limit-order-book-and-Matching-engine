@@ -1,10 +1,10 @@
 fastapi==0.115.6
 uvicorn[standard]==0.32.1
 pydantic==2.10.3
-websockets==14.1
-httpx==0.28.1
+websockets>=15.0.0
+httpx>=0.28.0
 yfinance
 requests
-google-genai>=1.0.0
+google-genai>=2.0.0
 supabase>=2.0.0
 python-dotenv>=1.0.0

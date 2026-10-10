@@ -48,16 +48,20 @@ fairsplit_router = APIRouter(prefix="/fairsplit", tags=["FairSplit"])
 _supabase = None
 
 def _get_supabase():
+    """Return a Supabase client using the service role key (bypasses RLS).
+    The service key is used only in trusted backend code and never sent to the browser."""
     global _supabase
     if _supabase is not None:
         return _supabase
     url = os.getenv("SUPABASE_URL")
-    key = os.getenv("SUPABASE_KEY")
+    # Prefer service key (bypasses RLS); fall back to anon key for read-only ops
+    key = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_KEY")
     if not url or not key:
         return None
     try:
         from supabase import create_client
         _supabase = create_client(url, key)
+        logger.info("[fairsplit] Supabase client initialized (service key)")
         return _supabase
     except Exception as e:
         logger.warning(f"[fairsplit] Supabase init failed: {e}")
@@ -338,7 +342,9 @@ async def search_apartments(req: ApartmentSearchRequest):
             if req.max_budget:
                 query = query.lte("monthly_rent", req.max_budget)
             if req.neighborhood:
-                query = query.ilike("neighborhood", f"%{req.neighborhood}%")
+                # Match neighborhood name OR city (e.g. "Brooklyn" matches Park Slope, Williamsburg, etc.)
+                n = req.neighborhood
+                query = query.or_(f"neighborhood.ilike.%{n}%,city.ilike.%{n}%")
             if req.bedrooms:
                 query = query.eq("bedrooms", req.bedrooms)
             if req.available_before:
@@ -391,26 +397,34 @@ async def find_compatible_roommates(req: MatchRequest):
     per_person = math.ceil(apt["monthly_rent"] / apt["bedrooms"])
     capacity = apt["bedrooms"]
 
-    # Fetch candidates
+    # Fetch candidates — always try Supabase first (with or without candidate_ids filter)
     candidates_raw = []
-    if _using_supabase() and req.candidate_ids:
+    if _using_supabase():
         try:
             sb = _get_supabase()
-            prefs_res = sb.table("housing_preferences").select("*,profiles(display_name)").execute()
+            # Join housing_preferences with profiles to get display_name
+            prefs_res = sb.table("housing_preferences")\
+                .select("profile_id,maximum_monthly_budget,move_in_date,smoking_preference,preferred_roommate_count,profiles(display_name)")\
+                .execute()
             for row in (prefs_res.data or []):
-                if not req.candidate_ids or row["profile_id"] in req.candidate_ids:
-                    candidates_raw.append({
-                        "id": row["profile_id"],
-                        "display_name": row.get("profiles", {}).get("display_name", "Unknown"),
-                        "max_budget": row["maximum_monthly_budget"],
-                        "move_in_date": str(row["move_in_date"]),
-                        "smoking_preference": row["smoking_preference"],
-                        "preferred_roommate_count": row["preferred_roommate_count"],
-                    })
+                # Filter to requested candidates if a list was provided
+                if req.candidate_ids and row["profile_id"] not in req.candidate_ids:
+                    continue
+                profile_info = row.get("profiles") or {}
+                candidates_raw.append({
+                    "id": row["profile_id"],
+                    "display_name": profile_info.get("display_name", "Unknown"),
+                    "max_budget": row["maximum_monthly_budget"],
+                    "move_in_date": str(row["move_in_date"]),
+                    "smoking_preference": row["smoking_preference"],
+                    "preferred_roommate_count": row["preferred_roommate_count"],
+                })
+            logger.info(f"[fairsplit] Fetched {len(candidates_raw)} candidates from Supabase")
         except Exception as e:
-            logger.warning(f"[fairsplit] Supabase error: {e}")
+            logger.warning(f"[fairsplit] Supabase candidate fetch error: {e}")
 
     if not candidates_raw:
+        logger.warning("[fairsplit] Using synthetic candidates (Supabase unavailable)")
         candidates_raw = [
             {
                 "id": p["id"],
@@ -422,10 +436,8 @@ async def find_compatible_roommates(req: MatchRequest):
             }
             for p in SYNTHETIC_PROFILES
         ]
-
-    # Filter by requested candidates if specified
-    if req.candidate_ids:
-        candidates_raw = [c for c in candidates_raw if c["id"] in req.candidate_ids]
+        if req.candidate_ids:
+            candidates_raw = [c for c in candidates_raw if c["id"] in req.candidate_ids]
 
     # Call C++ matcher
     groups_raw = await _call_cpp_matcher(capacity, per_person, candidates_raw)

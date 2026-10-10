@@ -37,5 +37,10 @@ build/
 .vercel
 .env*.local
 .env.local
+.env
+*.env
 *.tar.gz
 google-cloud-sdk/
+__pycache__/
+scripts/__pycache__/
+tests/__pycache__/
