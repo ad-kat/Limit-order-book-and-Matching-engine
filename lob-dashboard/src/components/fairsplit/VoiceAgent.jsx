@@ -115,6 +115,12 @@ export default function VoiceAgent() {
   const workletNodeRef     = useRef(null)
   const streamRef          = useRef(null)
   const workletRegistered  = useRef(false)
+  // Web Speech API fallback for user transcript display
+  const srRef              = useRef(null)
+  const srFinalRef         = useRef('')    // accumulated finals for current utterance
+  const geminiSpeakingRef  = useRef(false) // true while Gemini audio is playing
+  const userDoneRef        = useRef(false) // true after Done pressed; blocks SR restart
+  const sourceRef          = useRef(null)  // MediaStreamSourceNode (kept to pause/resume)
   // Playback scheduling (BUG 1 fix)
   const nextPlayTimeRef    = useRef(0)
   const activeSrcsRef      = useRef([])   // BufferSourceNodes currently scheduled
@@ -123,6 +129,18 @@ export default function VoiceAgent() {
   useEffect(() => {
     transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [transcript])
+
+  // Enter key = "I'm done speaking, answer me"
+  useEffect(() => {
+    const handler = (e) => {
+      if (e.key === 'Enter' && micOn && e.target.tagName !== 'INPUT') {
+        e.preventDefault()
+        sendActivityEnd()
+      }
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [micOn])
 
   // Accumulate streaming transcript tokens: append to last bubble if same role
   const addTranscript = useCallback((role, text) => {
@@ -177,8 +195,14 @@ export default function VoiceAgent() {
 
       src.onended = () => {
         activeSrcsRef.current = activeSrcsRef.current.filter(s => s !== src)
-        // If queue is empty, we're done speaking
         if (activeSrcsRef.current.length === 0) {
+          // Audio fully played — NOW safe to re-enable mic and SR
+          geminiSpeakingRef.current = false
+          userDoneRef.current = false
+          if (sourceRef.current && workletNodeRef.current) {
+            try { sourceRef.current.connect(workletNodeRef.current) } catch {}
+          }
+          if (srRef.current) { try { srRef.current.start() } catch {} }
           setStatus(prev => prev === 'speaking' ? (micOn ? 'listening' : 'idle') : prev)
         }
       }
@@ -228,7 +252,36 @@ export default function VoiceAgent() {
           break
 
         case 'audio':
+          geminiSpeakingRef.current = true
           scheduleAudioChunk(msg.data)
+          break
+
+        case 'interrupted':
+          stopPlayback()  // clears activeSrcsRef
+          geminiSpeakingRef.current = false
+          userDoneRef.current = false
+          srFinalRef.current = ''
+          if (sourceRef.current && workletNodeRef.current) {
+            try { sourceRef.current.connect(workletNodeRef.current) } catch {}
+          }
+          if (srRef.current) { try { srRef.current.start() } catch {} }
+          setStatus(micOn ? 'listening' : 'idle')
+          break
+
+        case 'turn_complete':
+          // Don't reconnect mic/SR here — audio is still playing.
+          // src.onended (when queue empties) handles the reconnect safely.
+          srFinalRef.current = ''
+          // If no audio was sent (e.g. tool-only turn), reconnect immediately
+          if (activeSrcsRef.current.length === 0) {
+            geminiSpeakingRef.current = false
+            userDoneRef.current = false
+            if (sourceRef.current && workletNodeRef.current) {
+              try { sourceRef.current.connect(workletNodeRef.current) } catch {}
+            }
+            if (srRef.current) { try { srRef.current.start() } catch {} }
+            setStatus(micOn ? 'listening' : 'idle')
+          }
           break
 
         case 'error':
@@ -271,6 +324,11 @@ export default function VoiceAgent() {
     workletNodeRef.current = null
     streamRef.current?.getTracks().forEach(t => t.stop())
     streamRef.current = null
+    if (srRef.current) {
+      try { srRef.current.stop() } catch {}
+      srRef.current = null
+    }
+    srFinalRef.current = ''
   }
 
   async function startMic() {
@@ -290,6 +348,7 @@ export default function VoiceAgent() {
       }
 
       const source = ctx.createMediaStreamSource(stream)
+      sourceRef.current = source
       const node   = new AudioWorkletNode(ctx, 'pcm-capture')
       workletNodeRef.current = node
 
@@ -305,6 +364,51 @@ export default function VoiceAgent() {
       // Connect mic to worklet; do NOT connect worklet to destination (no feedback)
       source.connect(node)
 
+      // Web Speech API — browser-side transcript so the user sees their own words.
+      // Runs in parallel with the AudioWorklet PCM path; does NOT send extra audio.
+      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition
+      if (SpeechRecognition) {
+        const sr = new SpeechRecognition()
+        sr.lang = 'en-US'
+        sr.continuous = true
+        sr.interimResults = true
+        srFinalRef.current = ''
+        sr.onresult = (event) => {
+          // SR is display-only — never sends signals to Gemini.
+          // Gemini's built-in VAD handles turn boundaries independently.
+          if (geminiSpeakingRef.current) return  // ignore echo of Gemini's own voice
+          let interim = ''
+          for (let i = event.resultIndex; i < event.results.length; i++) {
+            const t = event.results[i][0].transcript
+            if (event.results[i].isFinal) {
+              srFinalRef.current += t + ' '
+            } else {
+              interim = t
+            }
+          }
+          const display = (srFinalRef.current + interim).trim()
+          if (display) {
+            setTranscript(prev => {
+              if (prev.length > 0 && prev[prev.length - 1].role === 'user') {
+                const updated = [...prev]
+                updated[updated.length - 1] = { role: 'user', text: display }
+                return updated
+              }
+              return [...prev, { role: 'user', text: display }]
+            })
+          }
+        }
+        sr.onerror = () => {}
+        sr.onend = () => {
+          // Restart SR only if user hasn't pressed Done AND Gemini isn't speaking
+          if (srRef.current && !userDoneRef.current && !geminiSpeakingRef.current) {
+            try { srRef.current.start() } catch {}
+          }
+        }
+        srRef.current = sr
+        sr.start()
+      }
+
       setMicOn(true)
       setStatus('listening')
     } catch (e) {
@@ -316,8 +420,6 @@ export default function VoiceAgent() {
     teardownMic()
     workletRegistered.current = false  // reset so next startMic re-registers
     setMicOn(false)
-    // Do NOT send audio_stream_end — that permanently kills Gemini audio input.
-    // Gemini's VAD will handle the boundary naturally.
     setStatus(prev => prev === 'listening' ? 'idle' : prev)
   }
 
@@ -327,6 +429,19 @@ export default function VoiceAgent() {
     } else {
       startMic()
     }
+  }
+
+  function sendActivityEnd() {
+    if (userDoneRef.current) return  // already submitted — ignore double-click/Enter
+    userDoneRef.current = true
+    // Stop SR immediately — freeze the transcript
+    if (srRef.current) { try { srRef.current.stop() } catch {} }
+    // Disconnect the mic→worklet path so Gemini receives silence.
+    // Gemini's VAD detects the silence and triggers its response.
+    if (sourceRef.current && workletNodeRef.current) {
+      try { sourceRef.current.disconnect(workletNodeRef.current) } catch {}
+    }
+    setStatus('thinking')
   }
 
   function sendText() {
@@ -374,6 +489,16 @@ export default function VoiceAgent() {
               onClick={toggleMic}
             >
               {micOn ? '🎤 Mute' : '🎤 Speak'}
+            </button>
+          )}
+          {micOn && (
+            <button
+              className="btn btn--primary"
+              onClick={sendActivityEnd}
+              disabled={status === 'thinking'}
+              title="Done speaking — press Enter or click"
+            >
+              {status === 'thinking' ? 'Waiting…' : 'Done ↵'}
             </button>
           )}
         </div>

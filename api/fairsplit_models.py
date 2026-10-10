@@ -177,7 +177,7 @@ class HousingOfferCreate(BaseModel):
 
 class HousingOfferOut(BaseModel):
     id:                  str
-    owner_profile_id:    str
+    owner_profile_id:    Optional[str] = None   # NULL in legacy Supabase rows
     title:               str
     city:                str
     neighborhood:        str

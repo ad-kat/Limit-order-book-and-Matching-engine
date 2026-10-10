@@ -1,23 +1,35 @@
 """
 fairsplit_agent.py — Gemini Live voice agent WebSocket proxy.
 
-Verified against google-genai 2.29.0 / Gemini Live API (Oct 2026).
+google-genai 2.29.0 / Gemini Live API (Oct 2026).
 
-Model: $GEMINI_LIVE_MODEL (default: gemini-3.8-live)  — bidiGenerateContent
+Model: $GEMINI_LIVE_MODEL (default: gemini-3.8-live)
 Audio in:  PCM 16-bit LE, 16 kHz, mono  (mime: audio/pcm;rate=16000)
 Audio out: PCM 16-bit LE, 24 kHz, mono  (mime: audio/pcm;rate=24000)
 
-Client → server WebSocket messages:
-  JSON {"type":"text","text":"..."}       — text turn
-  JSON {"type":"end_audio"}              — explicit end-of-turn after audio
-  JSON {"type":"ping"}                   — keepalive
-  raw bytes / base64 string              — PCM audio chunk (16 kHz, 16-bit LE)
+Architecture:
+  Browser <--WS--> FastAPI handler
+    _send_loop   — browser → Gemini write queue
+    _recv_loop   — Gemini → browser, also pushes tool responses to write queue
+    _writer_loop — single serialized consumer of write queue → Gemini
 
-Server → client WebSocket messages:
+All sends to Gemini go through the write queue to prevent concurrent-send
+races that cause the session to silently hang after tool calls.
+
+Client → server WebSocket messages (JSON):
+  {"type":"text","text":"..."}           — text turn
+  {"type":"audio_chunk","data":"<b64>"}  — PCM16 audio (16 kHz)
+  {"type":"activity_start"}             — user began speaking
+  {"type":"activity_end"}               — user stopped speaking (Gemini may respond)
+  {"type":"ping"}                        — keepalive (ignored)
+
+Server → client WebSocket messages (JSON):
   {"type":"status",     "status":"connecting"|"connected"|"idle"|"error"}
   {"type":"transcript", "role":"user"|"model", "text":"..."}
-  {"type":"audio",      "data":"<base64 PCM 24 kHz>", "mime":"audio/pcm;rate=24000"}
+  {"type":"audio",      "data":"<b64 PCM 24 kHz>", "mime":"audio/pcm;rate=24000"}
   {"type":"tool_call",  "tool":"...", "args":{...}, "result":{...}}
+  {"type":"interrupted"}                — Gemini interrupted its own output
+  {"type":"turn_complete"}              — Gemini finished a turn
   {"type":"error",      "message":"..."}
 """
 from __future__ import annotations
@@ -27,20 +39,18 @@ import base64
 import json
 import logging
 import os
+import time
 from typing import Any
 
 from fastapi import WebSocket, WebSocketDisconnect
 
 logger = logging.getLogger("fairsplit.agent")
 
-GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")
-# Model is configurable via GEMINI_LIVE_MODEL env var.
-# Default: gemini-3.8-live — independently verified to support native audio I/O,
-# real-time audio input via send_realtime_input, and function calling.
-# Do NOT use the models/ prefix — the SDK resolves the name correctly without it.
-GEMINI_MODEL    = os.getenv("GEMINI_LIVE_MODEL", "gemini-3.8-live")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+# Read GEMINI_LIVE_MODEL first; never fall back to a non-live GEMINI_MODEL.
+GEMINI_MODEL = os.getenv("GEMINI_LIVE_MODEL") or "models/gemini-2.5-flash-native-audio-latest"
 
-_DEMO_OWNER_PROFILE_ID = "profile-alex-001"   # demo session owner for offer creation
+_DEMO_OWNER_PROFILE_ID = "profile-alex-001"
 
 SYSTEM_PROMPT = (
     "You are FairSplit, an AI assistant helping students find compatible roommates "
@@ -49,6 +59,7 @@ SYSTEM_PROMPT = (
     "When a user describes housing needs, use the available tools to search apartments "
     "and find compatible roommate groups. "
     "Always confirm before creating a group invitation. "
+    "After any tool call, immediately summarize the result in spoken audio for the user. "
     "Synthetic demo data is in use — label any results as demo data.\n\n"
     "BUDGET MATH: When a user gives a per-person budget, pass it as "
     "max_rent_per_person_dollars (plain US dollars, e.g. 1300 for $1,300/person) "
@@ -65,7 +76,8 @@ SYSTEM_PROMPT = (
     f"Always use owner_profile_id='{_DEMO_OWNER_PROFILE_ID}' for demo session offers."
 )
 
-# ── Tool declarations (genai 2.x keyword-arg style) ────────────────────────────
+
+# ── Tool declarations ──────────────────────────────────────────────────────────
 
 def _make_tools():
     from google.genai import types as gt
@@ -92,8 +104,8 @@ def _make_tools():
                             "type": "INTEGER",
                             "description": "Number of people sharing the apartment (default: same as bedrooms)",
                         },
-                        "neighborhood":  {"type": "STRING",  "description": "Preferred neighborhood or borough, e.g. Brooklyn"},
-                        "bedrooms":      {"type": "INTEGER", "description": "Number of bedrooms"},
+                        "neighborhood": {"type": "STRING", "description": "Preferred neighborhood or borough, e.g. Brooklyn"},
+                        "bedrooms":     {"type": "INTEGER", "description": "Number of bedrooms"},
                     },
                 },
             ),
@@ -163,35 +175,20 @@ def _make_tools():
                 parameters={
                     "type": "OBJECT",
                     "properties": {
-                        "title": {
-                            "type": "STRING",
-                            "description": "Short listing title, e.g. 'Private room in Bushwick share'",
-                        },
-                        "neighborhood": {"type": "STRING", "description": "Brooklyn neighborhood or NYC area"},
-                        "city":         {"type": "STRING", "description": "City (default: New York)"},
-                        "rooms_available": {
-                            "type": "INTEGER",
-                            "description": "Number of rooms being offered (usually 1)",
-                        },
+                        "title":           {"type": "STRING"},
+                        "neighborhood":    {"type": "STRING"},
+                        "city":            {"type": "STRING"},
+                        "rooms_available": {"type": "INTEGER"},
                         "rent_per_room_dollars": {
                             "type": "NUMBER",
-                            "description": "Monthly rent per room in US dollars (e.g. 1200 for $1,200/mo). Do NOT send cents.",
+                            "description": "Monthly rent per room in US dollars. Do NOT send cents.",
                         },
-                        "available_from": {
-                            "type": "STRING",
-                            "description": "Move-in date as YYYY-MM-DD (fully resolved, no relative dates)",
-                        },
-                        "smoking_policy": {
-                            "type": "STRING",
-                            "description": "non_smoker | smoker | no_preference",
-                        },
-                        "description": {
-                            "type": "STRING",
-                            "description": "Optional free-text description of the room/apartment",
-                        },
+                        "available_from":  {"type": "STRING", "description": "YYYY-MM-DD"},
+                        "smoking_policy":  {"type": "STRING", "description": "non_smoker | smoker | no_preference"},
+                        "description":     {"type": "STRING"},
                         "owner_profile_id": {
                             "type": "STRING",
-                            "description": f"Profile ID of the offer owner. For demo sessions use '{_DEMO_OWNER_PROFILE_ID}'.",
+                            "description": f"For demo sessions use '{_DEMO_OWNER_PROFILE_ID}'.",
                         },
                     },
                     "required": [
@@ -207,11 +204,8 @@ def _make_tools():
                 parameters={
                     "type": "OBJECT",
                     "properties": {
-                        "neighborhood": {"type": "STRING", "description": "Neighborhood or borough"},
-                        "max_rent_per_room_dollars": {
-                            "type": "NUMBER",
-                            "description": "Maximum monthly rent per room in US dollars",
-                        },
+                        "neighborhood": {"type": "STRING"},
+                        "max_rent_per_room_dollars": {"type": "NUMBER"},
                     },
                 },
             ),
@@ -221,15 +215,47 @@ def _make_tools():
 
 # ── Internal tool dispatch ─────────────────────────────────────────────────────
 
+def _trim_result(result: dict, tool_name: str) -> dict:
+    """Keep only essential fields in tool results to avoid oversized FunctionResponses."""
+    if tool_name == "search_apartments":
+        apts = result.get("apartments", [])[:5]
+        trimmed = []
+        for a in apts:
+            trimmed.append({
+                "id":           a.get("id", ""),
+                "title":        a.get("title", ""),
+                "neighborhood": a.get("neighborhood", ""),
+                "bedrooms":     a.get("bedrooms"),
+                "per_person_rent_dollars": round(a.get("per_person_rent", 0) / 100, 2),
+                "available_from": a.get("available_from", ""),
+            })
+        return {"apartments": trimmed, "count": len(trimmed)}
+    if tool_name == "find_compatible_roommates":
+        groups = result.get("top_groups", [])[:3]
+        trimmed = []
+        for g in groups:
+            members = [{"display_name": m.get("display_name", ""), "id": m.get("id", "")}
+                       for m in g.get("members", [])]
+            trimmed.append({
+                "members": members,
+                "score":   round(g.get("score", 0), 1),
+                "explanation": g.get("explanation", "")[:200],
+            })
+        return {
+            "top_groups":      trimmed,
+            "per_person_rent_dollars": round(result.get("per_person_rent", 0) / 100, 2),
+        }
+    return result
+
+
 async def _call_internal(tool_name: str, args: dict) -> dict:
+    import httpx
+    base = os.getenv("INTERNAL_API_URL", "http://localhost:8000")
+    t0 = time.monotonic()
+    logger.info(f"[tool] http_start  tool={tool_name}")
     try:
-        import httpx
-        base = os.getenv("INTERNAL_API_URL", "http://localhost:8000")
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=15.0) as client:
             if tool_name == "search_apartments":
-                # BUG 2 FIX: normalize per-person dollars to total cents.
-                # Gemini sends max_rent_per_person_dollars + num_people;
-                # the search endpoint expects max_budget in cents (total).
                 search_args = dict(args)
                 per_person = search_args.pop("max_rent_per_person_dollars", None)
                 num_people = search_args.pop("num_people", None)
@@ -239,32 +265,30 @@ async def _call_internal(tool_name: str, args: dict) -> dict:
                     search_args["max_budget"] = int(float(per_person) * people * 100)
                 r = await client.post(f"{base}/fairsplit/search", json=search_args)
                 r.raise_for_status()
-                return {"apartments": r.json()}
+                result = {"apartments": r.json()}
 
             elif tool_name == "find_compatible_roommates":
                 r = await client.post(f"{base}/fairsplit/match", json=args)
                 r.raise_for_status()
-                return r.json()
+                result = r.json()
 
             elif tool_name == "propose_roommate_group":
                 r = await client.post(f"{base}/fairsplit/groups", json=args)
                 r.raise_for_status()
-                return r.json()
+                result = r.json()
 
             elif tool_name == "get_group_status":
-                gid = args.get("group_id", "")
-                r = await client.get(f"{base}/fairsplit/groups/{gid}")
+                r = await client.get(f"{base}/fairsplit/groups/{args.get('group_id','')}")
                 r.raise_for_status()
-                return r.json()
+                result = r.json()
 
             elif tool_name == "create_group_invitation":
                 gid = args.get("group_id", "")
                 r = await client.post(f"{base}/fairsplit/groups/{gid}/invite", json=args)
                 r.raise_for_status()
-                return r.json()
+                result = r.json()
 
             elif tool_name == "create_housing_offer":
-                # BUG 2 pattern: normalize dollars → cents exactly once here
                 dollars = args.get("rent_per_room_dollars")
                 if dollars is None:
                     return {"error": "rent_per_room_dollars is required"}
@@ -281,30 +305,32 @@ async def _call_internal(tool_name: str, args: dict) -> dict:
                     "owner_profile_id":    owner_id,
                 }
                 r = await client.post(
-                    f"{base}/fairsplit/offers",
-                    json=payload,
+                    f"{base}/fairsplit/offers", json=payload,
                     headers={"X-Demo-Profile-Id": owner_id},
                 )
                 r.raise_for_status()
-                return r.json()
+                result = r.json()
 
             elif tool_name == "search_room_offers":
                 params: dict = {}
                 if args.get("neighborhood"):
                     params["neighborhood"] = args["neighborhood"]
                 if args.get("max_rent_per_room_dollars"):
-                    params["max_rent_per_room_cents"] = int(
-                        float(args["max_rent_per_room_dollars"]) * 100
-                    )
+                    params["max_rent_per_room_cents"] = int(float(args["max_rent_per_room_dollars"]) * 100)
                 r = await client.get(f"{base}/fairsplit/offers", params=params)
                 r.raise_for_status()
-                return {"offers": r.json()}
+                result = {"offers": r.json()}
 
             else:
-                return {"error": f"Unknown tool: {tool_name}"}
+                result = {"error": f"Unknown tool: {tool_name}"}
+
+        elapsed = time.monotonic() - t0
+        logger.info(f"[tool] http_done   tool={tool_name}  status={r.status_code}  elapsed={elapsed:.3f}s")
+        return result
 
     except Exception as e:
-        logger.warning(f"[agent] internal call {tool_name} failed: {e}")
+        elapsed = time.monotonic() - t0
+        logger.warning(f"[tool] http_error  tool={tool_name}  elapsed={elapsed:.3f}s  error={e}")
         return {"error": str(e)}
 
 
@@ -314,8 +340,8 @@ async def _text_fallback_session(ws: WebSocket):
     await ws.send_json({"type": "status", "status": "connected"})
     await ws.send_json({
         "type": "transcript", "role": "model",
-        "text": "Hi! I'm FairSplit (demo mode — no Gemini key). "
-                "Try: 'Find apartments in Brooklyn' or 'Find roommates'.",
+        "text": "Hi! I'm FairSplit (demo mode — no Gemini key configured). "
+                "Type 'Find apartments in Brooklyn' or 'Find roommates' to try the API.",
     })
     while True:
         try:
@@ -350,78 +376,153 @@ async def _text_fallback_session(ws: WebSocket):
             await ws.send_json({"type": "tool_call", "tool": "find_compatible_roommates",
                                 "args": {"apartment_id": apt_id}, "result": result})
         else:
-            reply = "I can search apartments or find roommates. What do you need?"
+            reply = "I can search apartments or find roommates. What would you like?"
         await ws.send_json({"type": "transcript", "role": "model", "text": reply})
 
 
-# ── Gemini Live receive loop ───────────────────────────────────────────────────
+# ── Gemini write queue writer ──────────────────────────────────────────────────
+#
+# All sends to Gemini are serialized through a single asyncio.Queue.
+# This prevents concurrent-send races between _send_loop (forwarding
+# browser audio) and _recv_loop (sending tool responses), which caused
+# the session to silently hang after tool calls.
 
-async def _recv_loop(ws: WebSocket, session, transcript_buf: list):
-    """Read all Gemini server messages; forward audio, transcripts, tool calls."""
+_WRITER_SENTINEL = None
+
+async def _writer_loop(session, queue: asyncio.Queue):
+    """Drain the Gemini write queue — only task that calls session.send_*."""
     from google.genai import types as gt
+    while True:
+        item = await queue.get()
+        if item is _WRITER_SENTINEL:
+            queue.task_done()
+            break
+        cmd, payload = item
+        try:
+            t0 = time.monotonic()
+            if cmd == "audio":
+                # Use media= (primary documented parameter) instead of audio=
+                await session.send_realtime_input(media=payload)
+            elif cmd == "text":
+                await session.send_client_content(**payload)
+            elif cmd == "tool_response":
+                logger.info(f"[tool] send_tool_response_start  id={payload.get('id')}")
+                await session.send_tool_response(**payload)
+                logger.info(f"[tool] send_tool_response_done   elapsed={time.monotonic()-t0:.3f}s")
+            elif cmd == "activity_start":
+                await session.send_realtime_input(activity_start=gt.ActivityStart())
+            elif cmd == "activity_end":
+                await session.send_realtime_input(activity_end=gt.ActivityEnd())
+        except Exception as e:
+            logger.warning(f"[writer] cmd={cmd} error: {e}")
+        finally:
+            queue.task_done()
+
+
+# ── Gemini receive loop ────────────────────────────────────────────────────────
+
+async def _recv_loop(ws: WebSocket, session, queue: asyncio.Queue):
+    """Read Gemini messages; forward audio/transcripts; push tool responses to queue."""
+    from google.genai import types as gt
+    audio_chunks_fwd = 0
     try:
         async for msg in session.receive():
             sc = msg.server_content
             if sc:
-                # Audio chunks
+                if getattr(sc, "interrupted", False):
+                    logger.info("[recv] interrupted")
+                    await ws.send_json({"type": "interrupted"})
+
                 if sc.model_turn:
                     for part in sc.model_turn.parts:
                         if part.inline_data and part.inline_data.data:
+                            audio_chunks_fwd += 1
                             encoded = base64.b64encode(part.inline_data.data).decode()
+                            logger.debug(
+                                f"[recv] audio_chunk #{audio_chunks_fwd}  "
+                                f"bytes={len(part.inline_data.data)}"
+                            )
                             await ws.send_json({
                                 "type": "audio",
                                 "data": encoded,
                                 "mime": part.inline_data.mime_type or "audio/pcm;rate=24000",
                             })
                         if part.text and not getattr(part, "thought", False):
-                            transcript_buf.append(part.text)
+                            pass  # text parts covered by transcription below
 
-                # Output transcription (streamed word-by-word)
                 if sc.output_transcription and sc.output_transcription.text:
                     await ws.send_json({
                         "type": "transcript", "role": "model",
                         "text": sc.output_transcription.text,
                     })
 
-                # Input transcription (what user said)
                 if sc.input_transcription and sc.input_transcription.text:
                     await ws.send_json({
                         "type": "transcript", "role": "user",
                         "text": sc.input_transcription.text,
                     })
 
-            # Tool calls
+                if getattr(sc, "turn_complete", False):
+                    logger.info(f"[recv] turn_complete  audio_chunks_fwd={audio_chunks_fwd}")
+                    await ws.send_json({"type": "turn_complete"})
+                    audio_chunks_fwd = 0  # reset per turn
+
+                if getattr(sc, "go_away", None):
+                    logger.warning("[recv] go_away received — Gemini closing session")
+                    break
+
             if msg.tool_call:
                 for fc in msg.tool_call.function_calls:
-                    args = dict(fc.args) if fc.args else {}
-                    result = await _call_internal(fc.name, args)
-                    await ws.send_json({
-                        "type": "tool_call", "tool": fc.name,
-                        "args": args, "result": result,
-                    })
-                    await session.send_tool_response(function_responses=[
-                        gt.FunctionResponse(id=fc.id, name=fc.name, response={"result": result})
-                    ])
+                    fc_args = dict(fc.args) if fc.args else {}
+                    logger.info(f"[tool] tool_call_received  name={fc.name}  id={fc.id}  args_keys={list(fc_args.keys())}")
+
+                    result = await _call_internal(fc.name, fc_args)
+                    trimmed = _trim_result(result, fc.name)
+
+                    # Notify browser
+                    try:
+                        await ws.send_json({
+                            "type": "tool_call", "tool": fc.name,
+                            "args": fc_args, "result": trimmed,
+                        })
+                    except Exception:
+                        pass
+
+                    # Serialize tool response through write queue — do NOT call
+                    # session.send_tool_response directly (would race with audio sends)
+                    logger.info(f"[tool] queuing_tool_response  name={fc.name}  id={fc.id}")
+                    fr_kwargs = {
+                        "function_responses": [
+                            gt.FunctionResponse(
+                                id=fc.id,
+                                name=fc.name,
+                                response={"result": trimmed},
+                            )
+                        ]
+                    }
+                    await queue.put(("tool_response", fr_kwargs))
 
     except WebSocketDisconnect:
         pass
     except Exception as e:
-        logger.warning(f"[agent] recv_loop error: {e}")
+        logger.warning(f"[recv] error: {e}")
         try:
             await ws.send_json({"type": "error", "message": str(e)})
         except Exception:
             pass
+    finally:
+        # Signal writer to stop
+        await queue.put(_WRITER_SENTINEL)
 
 
-# ── Gemini Live send loop ──────────────────────────────────────────────────────
+# ── Browser → Gemini send loop ────────────────────────────────────────────────
 
-async def _send_loop(ws: WebSocket, session):
-    """Forward client WebSocket messages to Gemini."""
+async def _send_loop(ws: WebSocket, queue: asyncio.Queue):
+    """Forward browser WebSocket messages to the Gemini write queue."""
     from google.genai import types as gt
     try:
         while True:
             raw = await ws.receive()
-            # FastAPI WebSocket can receive text or bytes
             if "text" in raw:
                 data = raw["text"]
                 try:
@@ -429,41 +530,45 @@ async def _send_loop(ws: WebSocket, session):
                 except json.JSONDecodeError:
                     # Treat as raw base64 audio
                     audio_bytes = base64.b64decode(data)
-                    await session.send_realtime_input(
-                        audio=gt.Blob(data=audio_bytes, mime_type="audio/pcm;rate=16000")
-                    )
+                    if audio_bytes:
+                        await queue.put(("audio", gt.Blob(data=audio_bytes, mime_type="audio/pcm;rate=16000")))
                     continue
 
-                if msg.get("type") == "text":
-                    await session.send_client_content(
-                        turns=gt.Content(role="user", parts=[gt.Part(text=msg["text"])]),
-                        turn_complete=True,
-                    )
+                mtype = msg.get("type")
 
-                elif msg.get("type") == "audio_chunk":
+                if mtype == "text":
+                    await queue.put(("text", {
+                        "turns": gt.Content(role="user", parts=[gt.Part(text=msg["text"])]),
+                        "turn_complete": True,
+                    }))
+
+                elif mtype == "audio_chunk":
                     audio_bytes = base64.b64decode(msg["data"])
-                    await session.send_realtime_input(
-                        audio=gt.Blob(data=audio_bytes, mime_type="audio/pcm;rate=16000")
-                    )
+                    if audio_bytes:
+                        await queue.put(("audio", gt.Blob(data=audio_bytes, mime_type="audio/pcm;rate=16000")))
 
-                elif msg.get("type") == "end_audio":
-                    # BUG 3 FIX: do NOT send audio_stream_end — it permanently
-                    # terminates Gemini's audio input for this session, preventing
-                    # follow-up turns. Gemini's built-in VAD detects speech boundaries.
-                    pass
+                elif mtype == "activity_start":
+                    logger.info("[send] activity_start from browser")
+                    await queue.put(("activity_start", None))
 
-                # "ping" and unknown types are silently ignored
+                elif mtype == "activity_end":
+                    logger.info("[send] activity_end from browser")
+                    await queue.put(("activity_end", None))
+
+                elif mtype in ("end_audio", "ping"):
+                    pass  # ignored — VAD handles turn boundaries
 
             elif "bytes" in raw:
-                # Raw PCM bytes from client
-                await session.send_realtime_input(
-                    audio=gt.Blob(data=raw["bytes"], mime_type="audio/pcm;rate=16000")
-                )
+                if raw["bytes"]:
+                    await queue.put(("audio", gt.Blob(data=raw["bytes"], mime_type="audio/pcm;rate=16000")))
 
     except WebSocketDisconnect:
         pass
     except Exception as e:
-        logger.warning(f"[agent] send_loop error: {e}")
+        logger.warning(f"[send] error: {e}")
+    finally:
+        # Signal writer to stop (in case recv_loop already did, this is a no-op)
+        await queue.put(_WRITER_SENTINEL)
 
 
 # ── Main Gemini Live session ───────────────────────────────────────────────────
@@ -477,10 +582,7 @@ async def _gemini_live_session(ws: WebSocket):
         return
 
     model = GEMINI_MODEL
-    logger.info(
-        f"[agent] Starting Gemini Live session  model={model}  "
-        f"modalities=[AUDIO]  input_transcription=True  output_transcription=True"
-    )
+    logger.info(f"[agent] session_start  model={model}  modalities=[AUDIO]  transcription=input+output")
     await ws.send_json({"type": "status", "status": "connecting"})
 
     client = genai.Client(api_key=GEMINI_API_KEY)
@@ -493,20 +595,32 @@ async def _gemini_live_session(ws: WebSocket):
         output_audio_transcription=gt.AudioTranscriptionConfig(),
     )
 
+    write_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
+
     try:
         async with client.aio.live.connect(model=model, config=config) as session:
-            logger.info(f"[agent] Session open  model={model}")
+            logger.info(f"[agent] session_open  model={model}")
             await ws.send_json({"type": "status", "status": "connected"})
-            transcript_buf: list = []
-            await asyncio.gather(
-                _send_loop(ws, session),
-                _recv_loop(ws, session, transcript_buf),
+
+            # Run three tasks concurrently:
+            # 1. _send_loop:   browser → write queue
+            # 2. _recv_loop:   Gemini → browser (tool responses → write queue)
+            # 3. _writer_loop: write queue → Gemini (serialized, no races)
+            results = await asyncio.gather(
+                _send_loop(ws, write_queue),
+                _recv_loop(ws, session, write_queue),
+                _writer_loop(session, write_queue),
+                return_exceptions=True,
             )
+            for i, r in enumerate(results):
+                if isinstance(r, Exception):
+                    logger.warning(f"[agent] task {i} exited with exception: {r}")
+
     except WebSocketDisconnect:
         pass
     except Exception as e:
         err_str = str(e)
-        logger.error(f"[agent] Session error  model={model}  error={err_str}")
+        logger.error(f"[agent] session_error  model={model}  error={err_str}")
         try:
             await ws.send_json({"type": "error", "message": err_str})
         except Exception:
