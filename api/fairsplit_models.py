@@ -148,3 +148,44 @@ class AcceptInvitationResponse(BaseModel):
 class ProfileGroupsResponse(BaseModel):
     profile_id: str
     groups:     list[GroupOut]
+
+
+# ── Housing Offers (room-provider proposals) ───────────────────────────────────
+
+class OfferStatus(str, Enum):
+    open   = "open"
+    filled = "filled"
+    closed = "closed"
+
+
+class HousingOfferCreate(BaseModel):
+    """Body for POST /fairsplit/offers.
+
+    rent_per_room_cents is normalized once server-side from dollars — callers
+    never send cents directly to avoid double-conversion bugs.
+    """
+    title:               str
+    city:                str = "New York"
+    neighborhood:        str
+    rooms_available:     int = Field(1, ge=1, le=10)
+    rent_per_room_cents: int = Field(..., ge=1, description="Monthly rent per room in cents")
+    available_from:      str                         # ISO date YYYY-MM-DD
+    smoking_policy:      str = "no_preference"       # non_smoker | smoker | no_preference
+    description:         Optional[str] = None
+    owner_profile_id:    str
+
+
+class HousingOfferOut(BaseModel):
+    id:                  str
+    owner_profile_id:    str
+    title:               str
+    city:                str
+    neighborhood:        str
+    rooms_available:     int
+    rent_per_room_cents: int
+    available_from:      str
+    smoking_policy:      str
+    description:         Optional[str] = None
+    status:              str = "open"
+    is_synthetic:        bool = False
+    created_at:          Optional[str] = None

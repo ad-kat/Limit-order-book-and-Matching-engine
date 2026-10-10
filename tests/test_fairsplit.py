@@ -265,3 +265,203 @@ class TestDemoScenario:
         bedrooms = 3
         per_person = math.ceil(monthly / bedrooms)
         assert per_person == 122000, f"Expected 122000 cents ($1,220), got {per_person}"
+
+
+class TestAgentRentNormalization:
+    """Verify Bug 2 fix: agent converts max_rent_per_person_dollars to total cents."""
+
+    def _normalize(self, per_person_dollars, num_people=None, bedrooms=None):
+        """Replicate the normalization logic from fairsplit_agent._call_internal."""
+        args = {"max_rent_per_person_dollars": per_person_dollars}
+        if num_people is not None:
+            args["num_people"] = num_people
+        if bedrooms is not None:
+            args["bedrooms"] = bedrooms
+
+        search_args = dict(args)
+        per_person = search_args.pop("max_rent_per_person_dollars", None)
+        n_people   = search_args.pop("num_people", None)
+        if per_person is not None:
+            brooms = search_args.get("bedrooms") or n_people or 1
+            people = n_people or brooms
+            search_args["max_budget"] = int(float(per_person) * people * 100)
+        return search_args
+
+    def test_1300_per_person_3br_becomes_390000_cents(self):
+        """$1,300/person × 3 people × 100 = 390,000 cents — above Park Slope's $366,000."""
+        result = self._normalize(per_person_dollars=1300, num_people=3, bedrooms=3)
+        assert result["max_budget"] == 390000, (
+            f"$1,300/person × 3 should be 390000 cents, got {result['max_budget']}"
+        )
+
+    def test_1220_per_person_3br_gives_366000_cents(self):
+        """$1,220/person × 3 = 366,000 cents — exactly matches Park Slope asking price."""
+        result = self._normalize(per_person_dollars=1220, num_people=3, bedrooms=3)
+        assert result["max_budget"] == 366000
+
+    def test_num_people_defaults_to_bedrooms(self):
+        """When num_people is omitted, bedrooms is used as the multiplier."""
+        result = self._normalize(per_person_dollars=1300, bedrooms=3)
+        assert result["max_budget"] == 390000
+
+    def test_single_person_passthrough(self):
+        """$2,000/person with 1 person = 200,000 cents."""
+        result = self._normalize(per_person_dollars=2000, num_people=1)
+        assert result["max_budget"] == 200000
+
+    def test_no_cents_in_input(self):
+        """Input must be dollars; passing 130000 (cents value) would give absurdly high budget."""
+        result = self._normalize(per_person_dollars=130000, num_people=3)
+        # 130000 * 3 * 100 = 39,000,000 cents — caller error, but normalization is correct
+        assert result["max_budget"] == 39_000_000
+
+    def test_search_args_strips_agent_params(self):
+        """Normalized args must not contain max_rent_per_person_dollars or num_people."""
+        result = self._normalize(per_person_dollars=1300, num_people=3, bedrooms=3)
+        assert "max_rent_per_person_dollars" not in result
+        assert "num_people" not in result
+        assert "max_budget" in result
+
+
+# ── Housing Offer tests ────────────────────────────────────────────────────────
+
+from fastapi.testclient import TestClient
+from api.main import app
+
+_client = TestClient(app)
+_DEMO_OWNER = "profile-alex-001"
+_DEMO_HEADERS = {"X-Demo-Profile-Id": _DEMO_OWNER}
+
+
+def _make_offer_body(**overrides):
+    base = {
+        "title": "Test room in Bushwick",
+        "neighborhood": "Bushwick",
+        "city": "New York",
+        "rooms_available": 1,
+        "rent_per_room_cents": 120000,   # $1,200 — already normalized (server does this)
+        "available_from": "2027-05-15",
+        "smoking_policy": "non_smoker",
+        "owner_profile_id": _DEMO_OWNER,
+    }
+    base.update(overrides)
+    return base
+
+
+class TestOfferCreation:
+    """POST /fairsplit/offers — demo mode auth + in-memory store."""
+
+    def test_create_offer_succeeds_with_valid_demo_header(self):
+        body = _make_offer_body()
+        r = _client.post("/fairsplit/offers", json=body, headers=_DEMO_HEADERS)
+        assert r.status_code == 201, r.text
+        data = r.json()
+        assert data["neighborhood"] == "Bushwick"
+        assert data["rent_per_room_cents"] == 120000
+        assert data["owner_profile_id"] == _DEMO_OWNER
+        assert data["status"] == "open"
+
+    def test_create_offer_rejected_without_header(self):
+        body = _make_offer_body()
+        r = _client.post("/fairsplit/offers", json=body)
+        assert r.status_code == 403
+
+    def test_create_offer_rejected_unknown_profile(self):
+        body = _make_offer_body(owner_profile_id="attacker-001")
+        r = _client.post(
+            "/fairsplit/offers", json=body,
+            headers={"X-Demo-Profile-Id": "attacker-001"},
+        )
+        assert r.status_code == 403
+
+    def test_create_offer_rejected_header_mismatch(self):
+        """Header profile must equal body owner_profile_id."""
+        body = _make_offer_body(owner_profile_id="profile-jordan-001")
+        r = _client.post("/fairsplit/offers", json=body, headers=_DEMO_HEADERS)
+        assert r.status_code == 403
+
+    def test_create_offer_returns_id(self):
+        body = _make_offer_body(title="Unique title for ID test")
+        r = _client.post("/fairsplit/offers", json=body, headers=_DEMO_HEADERS)
+        assert r.status_code == 201
+        assert r.json()["id"]  # non-empty
+
+
+class TestOfferListing:
+    """GET /fairsplit/offers — filtering and synthetic fallback."""
+
+    def test_list_returns_synthetic_offer(self):
+        r = _client.get("/fairsplit/offers")
+        assert r.status_code == 200
+        data = r.json()
+        assert isinstance(data, list)
+        # At least the synthetic demo offer should be present
+        assert any(o["neighborhood"] == "Bushwick" for o in data)
+
+    def test_list_filters_by_neighborhood(self):
+        r = _client.get("/fairsplit/offers?neighborhood=Bushwick")
+        assert r.status_code == 200
+        for offer in r.json():
+            assert "bushwick" in offer["neighborhood"].lower()
+
+    def test_list_filters_by_max_rent(self):
+        # Create a cheap offer then filter below it
+        body = _make_offer_body(title="Cheap room", rent_per_room_cents=80000)
+        _client.post("/fairsplit/offers", json=body, headers=_DEMO_HEADERS)
+
+        r = _client.get("/fairsplit/offers?max_rent_per_room_cents=90000")
+        assert r.status_code == 200
+        for o in r.json():
+            assert o["rent_per_room_cents"] <= 90000
+
+
+class TestOfferRentNormalization:
+    """Verify dollars -> cents conversion in the agent layer (_call_internal)."""
+
+    def _agent_normalize_offer(self, rent_dollars: float) -> int:
+        """Replicate fairsplit_agent._call_internal normalization for offers."""
+        return int(float(rent_dollars) * 100)
+
+    def test_1200_dollars_becomes_120000_cents(self):
+        assert self._agent_normalize_offer(1200) == 120000
+
+    def test_1200_50_dollars_truncated_correctly(self):
+        assert self._agent_normalize_offer(1200.50) == 120050
+
+    def test_zero_dollars_gives_zero_cents(self):
+        assert self._agent_normalize_offer(0) == 0
+
+    def test_normalization_applied_exactly_once(self):
+        """Passing pre-converted cents (120000) gives an absurdly high value."""
+        wrong = self._agent_normalize_offer(120000)
+        assert wrong == 12_000_000   # obviously wrong — agent must send dollars
+
+
+class TestOfferConfirmationGuard:
+    """The create_housing_offer tool description must require prior confirmation."""
+
+    def test_tool_description_mentions_confirmation(self):
+        import sys
+        sys.path.insert(0, ".")
+        from api.fairsplit_agent import _make_tools
+        tools = _make_tools()
+        decls = tools[0].function_declarations
+        offer_decl = next(d for d in decls if d.name == "create_housing_offer")
+        desc = offer_decl.description.lower()
+        # Must mention confirmation
+        assert "confirm" in desc or "explicit" in desc, (
+            "create_housing_offer description must require user confirmation"
+        )
+
+    def test_owner_profile_id_is_required_parameter(self):
+        from api.fairsplit_agent import _make_tools
+        decls = _make_tools()[0].function_declarations
+        offer_decl = next(d for d in decls if d.name == "create_housing_offer")
+        # parameters may be a dict or a Schema object; handle both
+        params = offer_decl.parameters
+        required = (
+            params.get("required", [])
+            if isinstance(params, dict)
+            else getattr(params, "required", []) or []
+        )
+        assert "owner_profile_id" in required

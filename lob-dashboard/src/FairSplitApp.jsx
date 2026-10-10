@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react'
 import ApartmentCard from './components/fairsplit/ApartmentCard'
+import OfferCard from './components/fairsplit/OfferCard'
 import VoiceAgent from './components/fairsplit/VoiceAgent'
 import RoommateMatches from './components/fairsplit/RoommateMatches'
 import MyGroups from './components/fairsplit/MyGroups'
@@ -25,13 +26,15 @@ export default function FairSplitApp() {
   const [matchLoading, setMatchLoading]   = useState(false)
   const [groups, setGroups]               = useState([])
   const [groupsLoading, setGroupsLoading] = useState(false)
+  const [offers, setOffers]               = useState([])
   const [searchNhd, setSearchNhd]         = useState('')
   const [searchBeds, setSearchBeds]       = useState('')
   const [apiError, setApiError]           = useState('')
 
-  // Load apartments on mount
+  // Load apartments and offers on mount
   useEffect(() => {
     loadApartments()
+    loadOffers()
   }, [])
 
   // Load groups when groups tab is opened
@@ -106,9 +109,22 @@ export default function FairSplitApp() {
     await loadGroups()
   }
 
+  async function loadOffers(params = {}) {
+    try {
+      const qs = new URLSearchParams()
+      if (params.neighborhood) qs.set('neighborhood', params.neighborhood)
+      const res = await fetch(`${API_BASE}/fairsplit/offers?${qs}`)
+      const data = await res.json()
+      setOffers(Array.isArray(data) ? data : [])
+    } catch {
+      setOffers([])
+    }
+  }
+
   function handleSearch(e) {
     e.preventDefault()
     loadApartments({ neighborhood: searchNhd, bedrooms: searchBeds })
+    loadOffers({ neighborhood: searchNhd })
   }
 
   return (
@@ -178,7 +194,7 @@ export default function FairSplitApp() {
                 <button
                   type="button"
                   className="btn btn--outline"
-                  onClick={() => { setSearchNhd(''); setSearchBeds(''); loadApartments() }}
+                  onClick={() => { setSearchNhd(''); setSearchBeds(''); loadApartments(); loadOffers() }}
                 >
                   Clear
                 </button>
@@ -209,6 +225,20 @@ export default function FairSplitApp() {
                     </button>
                   </div>
                 ))}
+              </div>
+            )}
+            {/* Room offers */}
+            {offers.length > 0 && (
+              <div className="fs-section__offers">
+                <h3 className="fs-section__subtitle">Room Offers</h3>
+                <p className="fs-section__sub">People who already have a place and need a roommate.</p>
+                <div className="apt-grid">
+                  {offers.map(offer => (
+                    <div key={offer.id} className="apt-grid__item">
+                      <OfferCard offer={offer} />
+                    </div>
+                  ))}
+                </div>
               </div>
             )}
           </div>

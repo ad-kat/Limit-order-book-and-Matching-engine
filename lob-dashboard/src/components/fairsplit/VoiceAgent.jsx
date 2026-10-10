@@ -7,7 +7,7 @@ const WS_BASE  = API_BASE.replace(/^https?/, m => m === 'https' ? 'wss' : 'ws')
 // Gemini Live emits  PCM 16-bit LE at 24 kHz mono.
 const CAPTURE_SAMPLE_RATE  = 16000
 const PLAYBACK_SAMPLE_RATE = 24000
-const CHUNK_MS = 100   // how often to flush capture buffer
+const CHUNK_MS = 100   // capture chunk interval
 
 const STATUS_LABELS = {
   disconnected: 'Disconnected',
@@ -15,11 +15,12 @@ const STATUS_LABELS = {
   connected:    'Connected',
   listening:    'Listening…',
   speaking:     'Speaking…',
+  thinking:     'Thinking…',
   idle:         'Idle',
   error:        'Error',
 }
 
-// ── AudioWorklet processor inline (avoids separate file) ──────────────────────
+// ── AudioWorklet processor (inline blob, no separate file) ────────────────────
 const WORKLET_SRC = `
 class PcmCaptureProcessor extends AudioWorkletProcessor {
   constructor() {
@@ -32,17 +33,14 @@ class PcmCaptureProcessor extends AudioWorkletProcessor {
   process(inputs) {
     const ch = inputs[0]?.[0];
     if (!ch) return true;
-    // Downsample by picking every ratio-th sample
     for (let i = 0; i < ch.length; i++) {
       this._pos += 1;
       if (this._pos >= this._ratio) {
         this._pos -= this._ratio;
-        // Convert float32 → int16
         const s = Math.max(-1, Math.min(1, ch[i]));
         this._buf.push(s < 0 ? s * 0x8000 : s * 0x7FFF);
       }
     }
-    // Flush ~every CHUNK_MS
     const chunkSamples = Math.floor(this._target * ${CHUNK_MS} / 1000);
     if (this._buf.length >= chunkSamples) {
       const out = new Int16Array(this._buf.splice(0, chunkSamples));
@@ -65,7 +63,7 @@ function ToolActivity({ activity }) {
           <span className="tool-item__arrow">→</span>
           <span className="tool-item__result">
             {typeof item.result === 'object'
-              ? JSON.stringify(item.result).slice(0, 100)
+              ? JSON.stringify(item.result).slice(0, 120)
               : String(item.result)}
           </span>
         </div>
@@ -84,51 +82,43 @@ function TranscriptBubble({ entry }) {
   )
 }
 
-// ── Raw PCM playback ──────────────────────────────────────────────────────────
-// Gemini sends PCM 16-bit LE at 24 kHz. decodeAudioData() can't handle raw PCM;
-// we must build an AudioBuffer manually.
-function playPcm16(base64Data, audioCtx, onEnd) {
-  try {
-    const binary  = atob(base64Data)
-    const bytes   = new Uint8Array(binary.length)
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
-
-    const samples = bytes.length / 2
-    const buf     = audioCtx.createBuffer(1, samples, PLAYBACK_SAMPLE_RATE)
-    const ch      = buf.getChannelData(0)
-    const view    = new DataView(bytes.buffer)
-    for (let i = 0; i < samples; i++) {
-      // Read int16 LE, convert to float32 [-1, 1]
-      ch[i] = view.getInt16(i * 2, true) / 32768.0
-    }
-    const src = audioCtx.createBufferSource()
-    src.buffer = buf
-    src.connect(audioCtx.destination)
-    src.start(0)
-    src.onended = onEnd
-  } catch (e) {
-    // Audio playback failure is non-fatal
-    console.warn('[FairSplit] PCM playback error:', e)
-    onEnd?.()
+// ── PCM playback scheduler ────────────────────────────────────────────────────
+// BUG 1 FIX: every chunk was calling src.start(0), which means all chunks start
+// at the same wall-clock time and play simultaneously.
+// Fix: track nextPlaybackTime and schedule each chunk sequentially.
+function decodePcm16(base64Data, audioCtx) {
+  const binary = atob(base64Data)
+  const bytes  = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  const samples = bytes.length / 2
+  const buf     = audioCtx.createBuffer(1, samples, PLAYBACK_SAMPLE_RATE)
+  const ch      = buf.getChannelData(0)
+  const view    = new DataView(bytes.buffer)
+  for (let i = 0; i < samples; i++) {
+    ch[i] = view.getInt16(i * 2, true) / 32768.0
   }
+  return buf
 }
 
-// ── Main component ────────────────────────────────────────────────────────────
 export default function VoiceAgent() {
   const [status,       setStatus]       = useState('disconnected')
-  const [transcript,   setTranscript]   = useState([])  // [{role, text}]
+  const [transcript,   setTranscript]   = useState([])
   const [toolActivity, setToolActivity] = useState([])
   const [error,        setError]        = useState('')
   const [textInput,    setTextInput]    = useState('')
-  const [recording,    setRecording]    = useState(false)
+  const [micOn,        setMicOn]        = useState(false)
 
-  const wsRef           = useRef(null)
-  const audioCtxRef     = useRef(null)
-  const workletNodeRef  = useRef(null)
-  const streamRef       = useRef(null)
-  const transcriptEndRef = useRef(null)
-  // For accumulating streaming transcript tokens into one bubble per turn
-  const lastRoleRef     = useRef(null)
+  const wsRef              = useRef(null)
+  // One AudioContext for the entire session — never create a second one
+  const audioCtxRef        = useRef(null)
+  // Worklet
+  const workletNodeRef     = useRef(null)
+  const streamRef          = useRef(null)
+  const workletRegistered  = useRef(false)
+  // Playback scheduling (BUG 1 fix)
+  const nextPlayTimeRef    = useRef(0)
+  const activeSrcsRef      = useRef([])   // BufferSourceNodes currently scheduled
+  const transcriptEndRef   = useRef(null)
 
   useEffect(() => {
     transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -144,31 +134,74 @@ export default function VoiceAgent() {
       }
       return [...prev, { role, text }]
     })
-    lastRoleRef.current = role
   }, [])
 
-  const ensureAudioCtx = () => {
+  // Get (or create) the single AudioContext
+  const ensureAudioCtx = useCallback(() => {
     if (!audioCtxRef.current || audioCtxRef.current.state === 'closed') {
-      audioCtxRef.current = new AudioContext()
+      audioCtxRef.current = new AudioContext({ sampleRate: PLAYBACK_SAMPLE_RATE })
+      nextPlayTimeRef.current = 0
     }
     if (audioCtxRef.current.state === 'suspended') {
       audioCtxRef.current.resume()
     }
     return audioCtxRef.current
-  }
+  }, [])
 
+  // Stop all queued/playing audio (called on interrupt or disconnect)
+  const stopPlayback = useCallback(() => {
+    const now = audioCtxRef.current?.currentTime ?? 0
+    activeSrcsRef.current.forEach(src => {
+      try { src.stop(now) } catch {}
+    })
+    activeSrcsRef.current = []
+    nextPlayTimeRef.current = 0
+  }, [])
+
+  // Schedule one PCM chunk for sequential playback
+  const scheduleAudioChunk = useCallback((base64Data) => {
+    try {
+      const ctx = ensureAudioCtx()
+      const buf = decodePcm16(base64Data, ctx)
+
+      // Schedule at next available slot (never overlap)
+      const startTime = Math.max(ctx.currentTime + 0.02, nextPlayTimeRef.current)
+      nextPlayTimeRef.current = startTime + buf.duration
+
+      const src = ctx.createBufferSource()
+      src.buffer = buf
+      src.connect(ctx.destination)
+      src.start(startTime)
+
+      activeSrcsRef.current.push(src)
+
+      src.onended = () => {
+        activeSrcsRef.current = activeSrcsRef.current.filter(s => s !== src)
+        // If queue is empty, we're done speaking
+        if (activeSrcsRef.current.length === 0) {
+          setStatus(prev => prev === 'speaking' ? (micOn ? 'listening' : 'idle') : prev)
+        }
+      }
+
+      setStatus('speaking')
+    } catch (e) {
+      console.warn('[FairSplit] PCM schedule error:', e)
+    }
+  }, [ensureAudioCtx, micOn])
+
+  // ── WebSocket connection ──────────────────────────────────────────────────
   const connect = useCallback(() => {
-    if (wsRef.current?.readyState < 2) return
+    if (wsRef.current && wsRef.current.readyState < 2) return
     setStatus('connecting')
     setError('')
     setTranscript([])
     setToolActivity([])
-    lastRoleRef.current = null
+    stopPlayback()
 
     const ws = new WebSocket(`${WS_BASE}/fairsplit/agent`)
     wsRef.current = ws
 
-    ws.onopen = () => {}   // status set by server's first message
+    ws.onopen = () => {}   // status comes from server's first message
 
     ws.onmessage = (evt) => {
       let msg
@@ -178,23 +211,28 @@ export default function VoiceAgent() {
         case 'status':
           setStatus(msg.status)
           break
+
         case 'transcript':
           addTranscript(msg.role, msg.text)
+          // When model starts transcribing, show thinking if not already speaking
+          if (msg.role === 'model') {
+            setStatus(prev => prev === 'idle' || prev === 'listening' ? 'thinking' : prev)
+          }
           break
+
         case 'tool_call':
           setToolActivity(prev => [...prev.slice(-9), {
             tool: msg.tool, args: msg.args, result: msg.result,
           }])
+          setStatus('thinking')
           break
-        case 'audio': {
-          const ctx = ensureAudioCtx()
-          setStatus('speaking')
-          playPcm16(msg.data, ctx, () => setStatus('idle'))
+
+        case 'audio':
+          scheduleAudioChunk(msg.data)
           break
-        }
+
         case 'error':
           setError(msg.message)
-          // GEMINI_API_KEY missing → degrade to text mode, keep connected
           if (msg.message.includes('GEMINI_API_KEY')) {
             setStatus('connected')
           } else {
@@ -209,30 +247,47 @@ export default function VoiceAgent() {
       setError('WebSocket failed. Is the API server running on ' + API_BASE + '?')
     }
 
-    ws.onclose = (evt) => {
-      if (evt.code !== 1000) setStatus('disconnected')
-      stopRecording()
+    ws.onclose = () => {
+      stopPlayback()
+      teardownMic()
+      setMicOn(false)
+      setStatus('disconnected')
     }
-  }, [addTranscript])
+  }, [addTranscript, scheduleAudioChunk, stopPlayback])
 
   const disconnect = useCallback(() => {
-    stopRecording()
+    stopPlayback()
+    teardownMic()
+    setMicOn(false)
     wsRef.current?.close(1000, 'user disconnect')
     setStatus('disconnected')
-  }, [])
+  }, [stopPlayback])
 
   // ── PCM capture via AudioWorklet ──────────────────────────────────────────
-  async function startRecording() {
+  // BUG 3 FIX: mic stays on for the whole session; no per-turn start/stop.
+  // Gemini's built-in VAD detects speech boundaries — no audio_stream_end needed.
+  function teardownMic() {
+    workletNodeRef.current?.disconnect()
+    workletNodeRef.current = null
+    streamRef.current?.getTracks().forEach(t => t.stop())
+    streamRef.current = null
+  }
+
+  async function startMic() {
+    if (micOn || workletNodeRef.current) return   // already running
     try {
       const ctx    = ensureAudioCtx()
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false })
       streamRef.current = stream
 
-      // Register worklet from a blob URL (no separate file needed)
-      const blob    = new Blob([WORKLET_SRC], { type: 'application/javascript' })
-      const blobUrl = URL.createObjectURL(blob)
-      await ctx.audioWorklet.addModule(blobUrl)
-      URL.revokeObjectURL(blobUrl)
+      // Register worklet only once per AudioContext (double-registration throws)
+      if (!workletRegistered.current) {
+        const blob    = new Blob([WORKLET_SRC], { type: 'application/javascript' })
+        const blobUrl = URL.createObjectURL(blob)
+        await ctx.audioWorklet.addModule(blobUrl)
+        URL.revokeObjectURL(blobUrl)
+        workletRegistered.current = true
+      }
 
       const source = ctx.createMediaStreamSource(stream)
       const node   = new AudioWorkletNode(ctx, 'pcm-capture')
@@ -240,35 +295,38 @@ export default function VoiceAgent() {
 
       node.port.onmessage = (e) => {
         if (wsRef.current?.readyState !== 1) return
-        // Send as base64-encoded PCM chunk
-        const pcm16    = new Int16Array(e.data)
-        const bytes    = new Uint8Array(pcm16.buffer)
-        let binary     = ''
+        const pcm16  = new Int16Array(e.data)
+        const bytes  = new Uint8Array(pcm16.buffer)
+        let binary   = ''
         for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i])
-        const b64      = btoa(binary)
-        wsRef.current.send(JSON.stringify({ type: 'audio_chunk', data: b64 }))
+        wsRef.current.send(JSON.stringify({ type: 'audio_chunk', data: btoa(binary) }))
       }
 
+      // Connect mic to worklet; do NOT connect worklet to destination (no feedback)
       source.connect(node)
-      node.connect(ctx.destination)   // needed to keep graph alive (silent output)
 
-      setRecording(true)
+      setMicOn(true)
       setStatus('listening')
     } catch (e) {
       setError('Microphone error: ' + e.message)
     }
   }
 
-  function stopRecording() {
-    workletNodeRef.current?.disconnect()
-    workletNodeRef.current = null
-    streamRef.current?.getTracks().forEach(t => t.stop())
-    streamRef.current = null
-    setRecording(false)
-    if (wsRef.current?.readyState === 1) {
-      wsRef.current.send(JSON.stringify({ type: 'end_audio' }))
+  function stopMic() {
+    teardownMic()
+    workletRegistered.current = false  // reset so next startMic re-registers
+    setMicOn(false)
+    // Do NOT send audio_stream_end — that permanently kills Gemini audio input.
+    // Gemini's VAD will handle the boundary naturally.
+    setStatus(prev => prev === 'listening' ? 'idle' : prev)
+  }
+
+  function toggleMic() {
+    if (micOn) {
+      stopMic()
+    } else {
+      startMic()
     }
-    if (status === 'listening') setStatus('idle')
   }
 
   function sendText() {
@@ -276,7 +334,17 @@ export default function VoiceAgent() {
     if (!text || wsRef.current?.readyState !== 1) return
     wsRef.current.send(JSON.stringify({ type: 'text', text }))
     setTextInput('')
+    setStatus('thinking')
   }
+
+  // Cleanup on component unmount
+  useEffect(() => {
+    return () => {
+      stopPlayback()
+      teardownMic()
+      wsRef.current?.close()
+    }
+  }, [stopPlayback])
 
   const connected = status !== 'disconnected' && status !== 'connecting' && status !== 'error'
 
@@ -288,33 +356,35 @@ export default function VoiceAgent() {
           {STATUS_LABELS[status] || status}
         </div>
 
-        {error && (
-          <div className="agent-error">{error}</div>
-        )}
+        {error && <div className="agent-error">{error}</div>}
 
         <div className="agent-controls">
-          {status === 'disconnected' || status === 'error' ? (
-            <button className="btn btn--primary" onClick={connect}>Connect</button>
+          {!connected ? (
+            <button className="btn btn--primary" onClick={connect}
+              disabled={status === 'connecting'}>
+              {status === 'connecting' ? 'Connecting…' : 'Connect'}
+            </button>
           ) : (
             <button className="btn btn--outline" onClick={disconnect}>Disconnect</button>
           )}
 
           {connected && (
             <button
-              className={`btn btn--mic${recording ? ' btn--mic--active' : ''}`}
-              onClick={recording ? stopRecording : startRecording}
+              className={`btn btn--mic${micOn ? ' btn--mic--active' : ''}`}
+              onClick={toggleMic}
             >
-              {recording ? '⏹ Stop' : '🎤 Speak'}
+              {micOn ? '🎤 Mute' : '🎤 Speak'}
             </button>
           )}
         </div>
 
         <div className="agent-hint">
-          <p>Try saying:</p>
+          <p><strong>Demo script:</strong></p>
           <ul>
-            <li>"Find 3-bedroom apartments in Brooklyn"</li>
-            <li>"My budget is $1,300. Find me roommates."</li>
-            <li>"Find roommates for the Park Slope apartment"</li>
+            <li>"Find a 3BR in Brooklyn under $1,300 per person"</li>
+            <li>"I prefer non-smokers. Best match?"</li>
+            <li>"What about the second group?"</li>
+            <li>"Okay, invite them" → confirm → group created</li>
           </ul>
         </div>
 
@@ -326,7 +396,7 @@ export default function VoiceAgent() {
           {transcript.length === 0 && (
             <div className="transcript-empty">
               {connected
-                ? 'Say something or type below…'
+                ? 'Click 🎤 Speak then start talking, or type below…'
                 : 'Click Connect to start a voice session with FairSplit AI.'}
             </div>
           )}

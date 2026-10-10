@@ -21,7 +21,7 @@ import subprocess
 from datetime import date, datetime, timedelta
 from typing import Any, Optional
 
-from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Header, HTTPException, WebSocket, WebSocketDisconnect
 
 from .fairsplit_models import (
     AcceptInvitationResponse,
@@ -30,6 +30,8 @@ from .fairsplit_models import (
     CandidateOut,
     GroupMemberOut,
     GroupOut,
+    HousingOfferCreate,
+    HousingOfferOut,
     InviteRequest,
     InviteResponse,
     MatchRequest,
@@ -667,6 +669,189 @@ async def accept_invitation(invitation_id: str):
         status="accepted",
         message="Invitation accepted",
     )
+
+
+# ── Housing Offers ─────────────────────────────────────────────────────────────
+#
+# Authorization (demo mode):
+#   Creating an offer requires the X-Demo-Profile-Id header to contain a
+#   profile ID from FAIRSPLIT_DEMO_OWNER_IDS (env, comma-separated) or the
+#   built-in demo set.  This prevents anonymous writes via the service key.
+#   In a production deployment, replace this guard with real session auth.
+#
+_DEFAULT_DEMO_OWNERS = {
+    "profile-alex-001",
+    "profile-jordan-001",
+    "profile-sam-001",
+    "profile-taylor-001",
+    "profile-morgan-001",
+}
+
+def _allowed_owners() -> set[str]:
+    env = os.getenv("FAIRSPLIT_DEMO_OWNER_IDS", "")
+    if env.strip():
+        return {s.strip() for s in env.split(",") if s.strip()}
+    return _DEFAULT_DEMO_OWNERS
+
+
+SYNTHETIC_OFFERS: list[dict] = [
+    {
+        "id": "offer-demo-001",
+        "owner_profile_id": "profile-alex-001",
+        "title": "Private room in Bushwick share",
+        "city": "New York",
+        "neighborhood": "Bushwick",
+        "rooms_available": 1,
+        "rent_per_room_cents": 120000,
+        "available_from": "2026-11-01",
+        "smoking_policy": "non_smoker",
+        "description": "Furnished room in a 4BR apartment, 2 mins from the J train.",
+        "status": "open",
+        "is_synthetic": True,
+        "created_at": "2026-10-01T00:00:00Z",
+    },
+]
+
+# In-memory offer store for demo without Supabase
+_demo_offers: list[dict] = []
+
+
+def _offer_out(row: dict) -> HousingOfferOut:
+    return HousingOfferOut(
+        id=str(row["id"]),
+        owner_profile_id=row["owner_profile_id"],
+        title=row["title"],
+        city=row.get("city", "New York"),
+        neighborhood=row["neighborhood"],
+        rooms_available=row["rooms_available"],
+        rent_per_room_cents=row["rent_per_room_cents"],
+        available_from=str(row["available_from"]),
+        smoking_policy=row.get("smoking_policy", "no_preference"),
+        description=row.get("description"),
+        status=row.get("status", "open"),
+        is_synthetic=row.get("is_synthetic", False),
+        created_at=str(row.get("created_at", "")),
+    )
+
+
+@fairsplit_router.post("/offers", response_model=HousingOfferOut, status_code=201)
+async def create_housing_offer(
+    req: HousingOfferCreate,
+    x_demo_profile_id: Optional[str] = Header(None, alias="X-Demo-Profile-Id"),
+):
+    """Create a housing offer (room-provider proposal).
+
+    DEMO MODE: The X-Demo-Profile-Id header must match a known demo profile and
+    must equal req.owner_profile_id.  This prevents arbitrary profile
+    impersonation via the service key.
+    """
+    allowed = _allowed_owners()
+
+    # The header is required and must match the body's owner_profile_id
+    if not x_demo_profile_id:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "X-Demo-Profile-Id header required. "
+                "FairSplit offers use demo-mode auth — "
+                "pass a known demo profile ID in the header."
+            ),
+        )
+    if x_demo_profile_id not in allowed:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Profile {x_demo_profile_id!r} is not in the demo-owner allow-list.",
+        )
+    if x_demo_profile_id != req.owner_profile_id:
+        raise HTTPException(
+            status_code=403,
+            detail="X-Demo-Profile-Id must match owner_profile_id in the request body.",
+        )
+
+    if _using_supabase():
+        try:
+            sb = _get_supabase()
+            row = sb.table("housing_offers").insert({
+                "owner_profile_id": req.owner_profile_id,
+                "title": req.title,
+                "city": req.city,
+                "neighborhood": req.neighborhood,
+                "rooms_available": req.rooms_available,
+                "rent_per_room_cents": req.rent_per_room_cents,
+                "available_from": req.available_from,
+                "smoking_policy": req.smoking_policy,
+                "description": req.description,
+                "status": "open",
+                "is_synthetic": False,
+            }).execute()
+            return _offer_out(row.data[0])
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.warning(f"[fairsplit] Supabase offer insert error: {e}")
+            # Fall through to in-memory store
+
+    # In-memory fallback (demo without Supabase)
+    import uuid
+    record = {
+        "id": str(uuid.uuid4()),
+        "owner_profile_id": req.owner_profile_id,
+        "title": req.title,
+        "city": req.city,
+        "neighborhood": req.neighborhood,
+        "rooms_available": req.rooms_available,
+        "rent_per_room_cents": req.rent_per_room_cents,
+        "available_from": req.available_from,
+        "smoking_policy": req.smoking_policy,
+        "description": req.description,
+        "status": "open",
+        "is_synthetic": False,
+        "created_at": datetime.utcnow().isoformat() + "Z",
+    }
+    _demo_offers.append(record)
+    logger.info(f"[fairsplit] Offer created in-memory (Supabase unavailable): {record['id']}")
+    return _offer_out(record)
+
+
+@fairsplit_router.get("/offers", response_model=list[HousingOfferOut])
+async def list_housing_offers(
+    neighborhood: Optional[str] = None,
+    max_rent_per_room_cents: Optional[int] = None,
+    status: str = "open",
+    limit: int = 20,
+):
+    """List open room offers, optionally filtered by neighborhood and budget."""
+    if _using_supabase():
+        try:
+            sb = _get_supabase()
+            q = sb.table("housing_offers").select("*").eq("status", status)
+            if neighborhood:
+                q = q.or_(f"neighborhood.ilike.%{neighborhood}%,city.ilike.%{neighborhood}%")
+            if max_rent_per_room_cents:
+                q = q.lte("rent_per_room_cents", max_rent_per_room_cents)
+            res = q.limit(limit).execute()
+            rows = res.data or []
+            # Merge in-memory demo offers not yet in Supabase
+            return [_offer_out(r) for r in rows]
+        except Exception as e:
+            logger.warning(f"[fairsplit] Supabase offer list error: {e}")
+
+    # In-memory fallback
+    all_offers = list(SYNTHETIC_OFFERS) + _demo_offers
+    results = []
+    for o in all_offers:
+        if o.get("status", "open") != status:
+            continue
+        if neighborhood and neighborhood.lower() not in (
+            o.get("neighborhood", "") + " " + o.get("city", "")
+        ).lower():
+            continue
+        if max_rent_per_room_cents and o["rent_per_room_cents"] > max_rent_per_room_cents:
+            continue
+        results.append(_offer_out(o))
+        if len(results) >= limit:
+            break
+    return results
 
 
 @fairsplit_router.get("/profiles/{profile_id}/groups",

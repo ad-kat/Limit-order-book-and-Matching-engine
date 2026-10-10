@@ -232,12 +232,20 @@ async def market_feed_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Start the C++ engine and market feed on startup."""
+    """Start only the required services."""
     await engine.start()
-    feed_task = asyncio.create_task(market_feed_loop())
-    yield
-    feed_task.cancel()
-    await engine.stop()
+
+    feed_task = None
+    if os.getenv("ENABLE_MARKET_FEED", "false").lower() == "true":
+        feed_task = asyncio.create_task(market_feed_loop())
+
+    try:
+        yield
+    finally:
+        if feed_task is not None:
+            feed_task.cancel()
+            await asyncio.gather(feed_task, return_exceptions=True)
+        await engine.stop()
 
 
 # ── App ────────────────────────────────────────────────────────────────────────

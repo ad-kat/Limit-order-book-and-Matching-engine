@@ -3,7 +3,7 @@ fairsplit_agent.py — Gemini Live voice agent WebSocket proxy.
 
 Verified against google-genai 2.29.0 / Gemini Live API (Oct 2026).
 
-Model: models/gemini-2.5-flash-native-audio-latest  (bidiGenerateContent)
+Model: $GEMINI_LIVE_MODEL (default: gemini-3.8-live)  — bidiGenerateContent
 Audio in:  PCM 16-bit LE, 16 kHz, mono  (mime: audio/pcm;rate=16000)
 Audio out: PCM 16-bit LE, 24 kHz, mono  (mime: audio/pcm;rate=24000)
 
@@ -34,10 +34,13 @@ from fastapi import WebSocket, WebSocketDisconnect
 logger = logging.getLogger("fairsplit.agent")
 
 GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")
-# Primary model: supports bidiGenerateContent + native audio I/O
-GEMINI_MODEL    = "models/gemini-2.5-flash-native-audio-latest"
-# Fallback: also supports bidiGenerateContent
-GEMINI_FALLBACK = "models/gemini-3.1-flash-live-preview"
+# Model is configurable via GEMINI_LIVE_MODEL env var.
+# Default: gemini-3.8-live — independently verified to support native audio I/O,
+# real-time audio input via send_realtime_input, and function calling.
+# Do NOT use the models/ prefix — the SDK resolves the name correctly without it.
+GEMINI_MODEL    = os.getenv("GEMINI_LIVE_MODEL", "gemini-3.8-live")
+
+_DEMO_OWNER_PROFILE_ID = "profile-alex-001"   # demo session owner for offer creation
 
 SYSTEM_PROMPT = (
     "You are FairSplit, an AI assistant helping students find compatible roommates "
@@ -46,7 +49,20 @@ SYSTEM_PROMPT = (
     "When a user describes housing needs, use the available tools to search apartments "
     "and find compatible roommate groups. "
     "Always confirm before creating a group invitation. "
-    "Synthetic demo data is in use — label any results as demo data."
+    "Synthetic demo data is in use — label any results as demo data.\n\n"
+    "BUDGET MATH: When a user gives a per-person budget, pass it as "
+    "max_rent_per_person_dollars (plain US dollars, e.g. 1300 for $1,300/person) "
+    "and set num_people to the number of people sharing. "
+    "Example: '$1,300/person, 3 people' -> max_rent_per_person_dollars=1300, num_people=3. "
+    "The server multiplies these for you — do NOT pre-multiply or convert to cents.\n\n"
+    "ROOM OFFERS: When a user says they already have a room and want to find a roommate, "
+    "gather: neighborhood, rent per room (dollars/month), move-in date, smoking policy, "
+    "and number of rooms available. "
+    "Always resolve the full date as YYYY-MM-DD — if the year is unclear, ask. "
+    "Today is October 2026, so 'May 15' means 2027-05-15 unless the user says otherwise. "
+    "Repeat all details back and wait for explicit yes/confirm before calling "
+    "create_housing_offer. "
+    f"Always use owner_profile_id='{_DEMO_OWNER_PROFILE_ID}' for demo session offers."
 )
 
 # ── Tool declarations (genai 2.x keyword-arg style) ────────────────────────────
@@ -57,12 +73,26 @@ def _make_tools():
         gt.Tool(function_declarations=[
             gt.FunctionDeclaration(
                 name="search_apartments",
-                description="Search available apartments matching user preferences",
+                description=(
+                    "Search available apartments matching user preferences. "
+                    "Always use max_rent_per_person_dollars (not total rent, not cents). "
+                    "Pass num_people so the server computes the correct total."
+                ),
                 parameters={
                     "type": "OBJECT",
                     "properties": {
-                        "max_budget":    {"type": "INTEGER", "description": "Max total monthly rent in cents (e.g. 366000 for $3,660)"},
-                        "neighborhood":  {"type": "STRING",  "description": "Preferred neighborhood, e.g. Brooklyn"},
+                        "max_rent_per_person_dollars": {
+                            "type": "NUMBER",
+                            "description": (
+                                "Maximum rent per person in US dollars (e.g. 1300 for $1,300/person). "
+                                "Do NOT multiply by num_people — the server does that."
+                            ),
+                        },
+                        "num_people": {
+                            "type": "INTEGER",
+                            "description": "Number of people sharing the apartment (default: same as bedrooms)",
+                        },
+                        "neighborhood":  {"type": "STRING",  "description": "Preferred neighborhood or borough, e.g. Brooklyn"},
                         "bedrooms":      {"type": "INTEGER", "description": "Number of bedrooms"},
                     },
                 },
@@ -122,6 +152,69 @@ def _make_tools():
                     "required": ["group_id", "inviter_profile_id", "invitee_profile_id"],
                 },
             ),
+            gt.FunctionDeclaration(
+                name="create_housing_offer",
+                description=(
+                    "Post a room offer from someone who already has a place and wants a roommate. "
+                    "ONLY call this after the user has explicitly confirmed all details. "
+                    "Gather neighborhood, rent, date, smoking policy, and rooms_available first. "
+                    "Rent is in US dollars per room per month — do NOT convert to cents."
+                ),
+                parameters={
+                    "type": "OBJECT",
+                    "properties": {
+                        "title": {
+                            "type": "STRING",
+                            "description": "Short listing title, e.g. 'Private room in Bushwick share'",
+                        },
+                        "neighborhood": {"type": "STRING", "description": "Brooklyn neighborhood or NYC area"},
+                        "city":         {"type": "STRING", "description": "City (default: New York)"},
+                        "rooms_available": {
+                            "type": "INTEGER",
+                            "description": "Number of rooms being offered (usually 1)",
+                        },
+                        "rent_per_room_dollars": {
+                            "type": "NUMBER",
+                            "description": "Monthly rent per room in US dollars (e.g. 1200 for $1,200/mo). Do NOT send cents.",
+                        },
+                        "available_from": {
+                            "type": "STRING",
+                            "description": "Move-in date as YYYY-MM-DD (fully resolved, no relative dates)",
+                        },
+                        "smoking_policy": {
+                            "type": "STRING",
+                            "description": "non_smoker | smoker | no_preference",
+                        },
+                        "description": {
+                            "type": "STRING",
+                            "description": "Optional free-text description of the room/apartment",
+                        },
+                        "owner_profile_id": {
+                            "type": "STRING",
+                            "description": f"Profile ID of the offer owner. For demo sessions use '{_DEMO_OWNER_PROFILE_ID}'.",
+                        },
+                    },
+                    "required": [
+                        "title", "neighborhood", "rooms_available",
+                        "rent_per_room_dollars", "available_from",
+                        "smoking_policy", "owner_profile_id",
+                    ],
+                },
+            ),
+            gt.FunctionDeclaration(
+                name="search_room_offers",
+                description="Search existing room offers from people who already have a place",
+                parameters={
+                    "type": "OBJECT",
+                    "properties": {
+                        "neighborhood": {"type": "STRING", "description": "Neighborhood or borough"},
+                        "max_rent_per_room_dollars": {
+                            "type": "NUMBER",
+                            "description": "Maximum monthly rent per room in US dollars",
+                        },
+                    },
+                },
+            ),
         ])
     ]
 
@@ -134,7 +227,17 @@ async def _call_internal(tool_name: str, args: dict) -> dict:
         base = os.getenv("INTERNAL_API_URL", "http://localhost:8000")
         async with httpx.AsyncClient(timeout=10.0) as client:
             if tool_name == "search_apartments":
-                r = await client.post(f"{base}/fairsplit/search", json=args)
+                # BUG 2 FIX: normalize per-person dollars to total cents.
+                # Gemini sends max_rent_per_person_dollars + num_people;
+                # the search endpoint expects max_budget in cents (total).
+                search_args = dict(args)
+                per_person = search_args.pop("max_rent_per_person_dollars", None)
+                num_people = search_args.pop("num_people", None)
+                if per_person is not None:
+                    bedrooms = search_args.get("bedrooms") or num_people or 1
+                    people   = num_people or bedrooms
+                    search_args["max_budget"] = int(float(per_person) * people * 100)
+                r = await client.post(f"{base}/fairsplit/search", json=search_args)
                 r.raise_for_status()
                 return {"apartments": r.json()}
 
@@ -159,6 +262,43 @@ async def _call_internal(tool_name: str, args: dict) -> dict:
                 r = await client.post(f"{base}/fairsplit/groups/{gid}/invite", json=args)
                 r.raise_for_status()
                 return r.json()
+
+            elif tool_name == "create_housing_offer":
+                # BUG 2 pattern: normalize dollars → cents exactly once here
+                dollars = args.get("rent_per_room_dollars")
+                if dollars is None:
+                    return {"error": "rent_per_room_dollars is required"}
+                owner_id = args.get("owner_profile_id", _DEMO_OWNER_PROFILE_ID)
+                payload = {
+                    "title":               args.get("title", "Room available"),
+                    "neighborhood":        args.get("neighborhood", ""),
+                    "city":                args.get("city", "New York"),
+                    "rooms_available":     args.get("rooms_available", 1),
+                    "rent_per_room_cents": int(float(dollars) * 100),
+                    "available_from":      args.get("available_from", ""),
+                    "smoking_policy":      args.get("smoking_policy", "no_preference"),
+                    "description":         args.get("description"),
+                    "owner_profile_id":    owner_id,
+                }
+                r = await client.post(
+                    f"{base}/fairsplit/offers",
+                    json=payload,
+                    headers={"X-Demo-Profile-Id": owner_id},
+                )
+                r.raise_for_status()
+                return r.json()
+
+            elif tool_name == "search_room_offers":
+                params: dict = {}
+                if args.get("neighborhood"):
+                    params["neighborhood"] = args["neighborhood"]
+                if args.get("max_rent_per_room_dollars"):
+                    params["max_rent_per_room_cents"] = int(
+                        float(args["max_rent_per_room_dollars"]) * 100
+                    )
+                r = await client.get(f"{base}/fairsplit/offers", params=params)
+                r.raise_for_status()
+                return {"offers": r.json()}
 
             else:
                 return {"error": f"Unknown tool: {tool_name}"}
@@ -307,7 +447,10 @@ async def _send_loop(ws: WebSocket, session):
                     )
 
                 elif msg.get("type") == "end_audio":
-                    await session.send_realtime_input(audio_stream_end=True)
+                    # BUG 3 FIX: do NOT send audio_stream_end — it permanently
+                    # terminates Gemini's audio input for this session, preventing
+                    # follow-up turns. Gemini's built-in VAD detects speech boundaries.
+                    pass
 
                 # "ping" and unknown types are silently ignored
 
@@ -333,6 +476,11 @@ async def _gemini_live_session(ws: WebSocket):
         await ws.send_json({"type": "error", "message": "google-genai not installed"})
         return
 
+    model = GEMINI_MODEL
+    logger.info(
+        f"[agent] Starting Gemini Live session  model={model}  "
+        f"modalities=[AUDIO]  input_transcription=True  output_transcription=True"
+    )
     await ws.send_json({"type": "status", "status": "connecting"})
 
     client = genai.Client(api_key=GEMINI_API_KEY)
@@ -345,9 +493,9 @@ async def _gemini_live_session(ws: WebSocket):
         output_audio_transcription=gt.AudioTranscriptionConfig(),
     )
 
-    model = GEMINI_MODEL
     try:
         async with client.aio.live.connect(model=model, config=config) as session:
+            logger.info(f"[agent] Session open  model={model}")
             await ws.send_json({"type": "status", "status": "connected"})
             transcript_buf: list = []
             await asyncio.gather(
@@ -358,29 +506,11 @@ async def _gemini_live_session(ws: WebSocket):
         pass
     except Exception as e:
         err_str = str(e)
-        logger.error(f"[agent] {model} error: {err_str}")
-        # Try fallback model
-        if "not found" in err_str.lower() or "404" in err_str or "unsupported" in err_str.lower():
-            logger.info(f"[agent] Retrying with fallback {GEMINI_FALLBACK}")
-            try:
-                async with client.aio.live.connect(model=GEMINI_FALLBACK, config=config) as session:
-                    await ws.send_json({"type": "status", "status": "connected"})
-                    transcript_buf: list = []
-                    await asyncio.gather(
-                        _send_loop(ws, session),
-                        _recv_loop(ws, session, transcript_buf),
-                    )
-            except Exception as e2:
-                logger.error(f"[agent] fallback error: {e2}")
-                try:
-                    await ws.send_json({"type": "error", "message": str(e2)})
-                except Exception:
-                    pass
-        else:
-            try:
-                await ws.send_json({"type": "error", "message": err_str})
-            except Exception:
-                pass
+        logger.error(f"[agent] Session error  model={model}  error={err_str}")
+        try:
+            await ws.send_json({"type": "error", "message": err_str})
+        except Exception:
+            pass
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
